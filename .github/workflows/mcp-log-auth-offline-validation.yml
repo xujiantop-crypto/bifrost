@@ -1,0 +1,238 @@
+name: MCP log deletion offline validation
+on:
+  push:
+    branches: [test/mcp-log-auth-validation]
+permissions:
+  contents: read
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 3cc62c4d2cbe79248b83f278cb7dad0de37c6e7a
+          fetch-depth: 0
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: transports/go.mod
+          cache-dependency-path: |
+            core/go.sum
+            framework/go.sum
+            transports/go.sum
+            plugins/*/go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Verify exact source and prepare the read-only baseline overlay
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = '3cc62c4d2cbe79248b83f278cb7dad0de37c6e7a'
+          git merge-base --is-ancestor 'e8b579fd1a710753cfa97611b5cff6c3411b0825' HEAD
+          go work init ./core ./framework ./transports
+          for d in plugins/*; do test ! -f "$d/go.mod" || go work use "./$d"; done
+          mkdir -p test-reports
+          git show 'e8b579fd1a710753cfa97611b5cff6c3411b0825:transports/bifrost-http/handlers/logging.go' > /tmp/mcp-log-auth-baseline.go
+          python - <<'PY'
+          import json, subprocess
+          from pathlib import Path
+          source=Path('transports/bifrost-http/handlers/logging.go').resolve()
+          Path('/tmp/mcp-log-auth-overlay.json').write_text(json.dumps({'Replace': {str(source): '/tmp/mcp-log-auth-baseline.go'}}))
+          paths=['transports/bifrost-http/lib/config.go', 'transports/bifrost-http/lib/config_test.go', 'transports/config.schema.json', 'framework/configstore/clientconfig.go', 'framework/configstore/complexityconfig.go', 'framework/configstore/tables/virtualkey.go']
+          result=[]
+          for path in paths:
+              before=subprocess.check_output(['git','rev-parse','e8b579fd1a710753cfa97611b5cff6c3411b0825:'+path],text=True).strip()
+              after=subprocess.check_output(['git','rev-parse','HEAD:'+path],text=True).strip()
+              result.append({'path':path,'baseline_blob':before,'tested_blob':after,'unchanged':before==after})
+          assert all(item['unchanged'] for item in result), 'historical lib failures require a fresh baseline comparison if their source changed'
+          Path('test-reports/baseline-unchanged-blobs.json').write_text(json.dumps(result,indent=2)+'\n')
+          PY
+          make install-gotestsum
+      - name: Exact-baseline red reproduction with final regression tests
+        working-directory: transports
+        run: |
+          set +e
+          go test -json -count=1 -timeout 10m -overlay=/tmp/mcp-log-auth-overlay.json -run '^TestDeleteMCPLogs' ./bifrost-http/handlers > ../test-reports/mcp-log-auth-red.jsonl 2>&1
+          red_exit=$?
+          set -e
+          printf '%s\n' "$red_exit" > ../test-reports/mcp-log-auth-red-exit.txt
+          python - <<'PY'
+          import json, re
+          from pathlib import Path
+          report=Path('../test-reports/mcp-log-auth-red.jsonl')
+          lines=report.read_text().splitlines()
+          events=[json.loads(line) for line in lines if line.startswith('{')]
+          failed=[event['Test'] for event in events if event.get('Action')=='fail' and event.get('Test')]
+          output=''.join(event.get('Output','') for event in events)
+          assert Path('../test-reports/mcp-log-auth-red-exit.txt').read_text().strip()=='1', output
+          assert failed and all(name.startswith('TestDeleteMCPLogs') for name in failed), failed
+          assert not any(event.get('Action')=='skip' for event in events), 'regression unexpectedly skipped'
+          assert re.search(r'expected:\s+403\s+actual\s*:\s+200', output), 'baseline must reach the missing-authorization status assertion, not a build/setup error\n'+output
+          print(json.dumps({'expected_red':True,'failed_tests':failed,'exact_baseline':'e8b579fd1a710753cfa97611b5cff6c3411b0825'}))
+          PY
+      - name: Canonical HTTP transport tests
+        if: always()
+        run: |
+          set +e
+          make test-http-transport 2>&1 | tee test-reports/canonical-http.log
+          printf '%s\n' "${PIPESTATUS[0]}" > test-reports/canonical-http-exit.txt
+          exit 0
+      - name: Fresh exact-parent lib comparison with strict recorded exits
+        if: always()
+        run: |
+          set -euo pipefail
+          git worktree add --detach /tmp/bifrost-mcp-auth-baseline 'e8b579fd1a710753cfa97611b5cff6c3411b0825'
+          cd /tmp/bifrost-mcp-auth-baseline
+          test "$(git rev-parse HEAD)" = 'e8b579fd1a710753cfa97611b5cff6c3411b0825'
+          go work init ./core ./framework ./transports
+          for d in plugins/*; do test ! -f "$d/go.mod" || go work use "./$d"; done
+          cd transports
+          set +e
+          gotestsum --format standard-verbose --junitfile "$GITHUB_WORKSPACE/test-reports/mcp-log-auth-baseline-lib.xml" -- -count=1 -timeout 10m ./bifrost-http/lib > "$GITHUB_WORKSPACE/test-reports/mcp-log-auth-baseline-lib.log" 2>&1
+          printf '%s\n' "$?" > "$GITHUB_WORKSPACE/test-reports/mcp-log-auth-baseline-lib-exit.txt"
+          gotestsum --format standard-verbose --junitfile "$GITHUB_WORKSPACE/test-reports/mcp-log-auth-baseline-repeat.xml" -- -count=3 -timeout 10m -run '^(TestMergeGovernanceConfig_(AppliesComplexityAnalyzerConfigWhenHashesAreEmpty|PreservesComplexityAnalyzerConfigWhenSectionHashesMatch|MergesComplexityKeywordsWhenSectionHashesChange|SourceOfTruthConfigJSONUsesComplexityFileConfig)|TestConfigSchemaSync|TestLoadConfig_ClientConfigSyncPreservesClientMetadata)$' ./bifrost-http/lib > "$GITHUB_WORKSPACE/test-reports/mcp-log-auth-baseline-repeat.log" 2>&1
+          printf '%s\n' "$?" > "$GITHUB_WORKSPACE/test-reports/mcp-log-auth-baseline-repeat-exit.txt"
+          exit 0
+      - name: Full handlers with strict test exit
+        if: always()
+        working-directory: transports
+        run: |
+          gotestsum --format standard-verbose --junitfile ../test-reports/mcp-log-auth-handlers.xml -- -count=1 -timeout 10m ./bifrost-http/handlers
+      - name: Authentication and deletion regressions with race detector
+        if: always()
+        working-directory: transports
+        run: |
+          gotestsum --format standard-verbose --junitfile ../test-reports/mcp-log-auth-race.xml -- -race -count=1 -timeout 10m -run '^Test(DeleteMCPLogs|AuthMiddleware|AuthBypassedMiddleware)' ./bifrost-http/handlers
+      - name: Vet and formatting
+        if: always()
+        working-directory: transports
+        run: |
+          go vet ./bifrost-http/handlers
+          test -z "$(gofmt -l bifrost-http/handlers/logging.go bifrost-http/handlers/logging_test.go)"
+      - name: Provider harness structure and Postman script syntax
+        if: always()
+        run: |
+          node --check tests/e2e/api/runners/augment-provider-harness.mjs
+          node --check tests/e2e/api/runners/filter-collection.mjs
+          node tests/e2e/api/runners/augment-provider-harness.mjs --source tests/e2e/api/collections/provider-harness.json --out /tmp/mcp-log-auth-augmented.json
+          node tests/e2e/api/runners/filter-collection.mjs --source /tmp/mcp-log-auth-augmented.json --out /tmp/mcp-log-auth-filtered.json --provider openai --feature mcp-log-delete-auth
+          node --input-type=module - /tmp/mcp-log-auth-filtered.json <<'JS'
+          import fs from 'node:fs';
+          import assert from 'node:assert/strict';
+          import vm from 'node:vm';
+          
+          const path = process.argv[2];
+          assert.ok(path, 'pass the filtered collection JSON path');
+          const collection = JSON.parse(fs.readFileSync(path, 'utf8'));
+          function leaves(items) {
+            return items.flatMap(item => item.item ? leaves(item.item) : [item]);
+          }
+          const cases = leaves(collection.item);
+          assert.equal(cases.length, 3, 'the scoped folder must contain exactly three request leaves');
+          assert.ok(cases.every(item => item.name.includes('mcp-log-delete-auth')));
+          assert.deepEqual(cases.map(item => item.request.method), ['GET', 'DELETE', 'DELETE']);
+          for (const item of cases) {
+            assert.equal(item.request.auth?.type, 'noauth');
+            assert.equal(item.protocolProfileBehavior?.followRedirects, false);
+            assert.equal(item.protocolProfileBehavior?.disableCookies, true);
+            for (const event of item.event ?? []) {
+              new vm.Script(event.script.exec.join('\n'), {filename: item.name});
+            }
+          }
+          assert.equal(cases[0].request.url, '{{baseUrl}}/api/session/is-auth-enabled');
+          const precondition = cases[0].event.find(event => event.listen === 'test').script.exec.join('\n');
+          assert.match(precondition, /body\.is_auth_enabled[\s\S]*to\.equal\(false\)/);
+          assert.match(precondition, /body\.has_valid_token[\s\S]*to\.equal\(false\)/);
+          for (const item of cases.slice(1)) {
+            assert.match(item.name, /^\[EXPECT-403\]/);
+            assert.equal(item.request.url, '{{baseUrl}}/api/mcp-logs');
+            const code = item.event.find(event => event.listen === 'test').script.exec.join('\n');
+            assert.match(code, /pm\.response\.code[\s\S]*to\.equal\(403\)/);
+            assert.match(code, /authenticated admin session/);
+          }
+          assert.deepEqual(JSON.parse(cases[1].request.body.raw).ids, ['harness-mcp-log-delete-auth-{{$guid}}']);
+          assert.equal(cases[2].request.body.raw, '{');
+          console.log(JSON.stringify({request_leaves: cases.length, methods: cases.map(item => item.request.method), script_syntax: 'passed', auth_disabled_precondition: true, live_requests: 0}));
+          JS
+      - name: Strict regression results and fresh baseline failure comparison
+        if: always()
+        run: |
+          python - <<'PY'
+          import json, re
+          from pathlib import Path
+          import xml.etree.ElementTree as E
+          root=Path('transports/bifrost-http')
+          expected=sorted({str(path.parent.relative_to(root)).replace('/', '-') for path in root.rglob('*_test.go')})
+          summaries=[]
+          failures=[]
+          canonical_failed_cases=[]
+          missing=[]
+          for name in expected:
+              path=Path('test-reports')/('http-transport-'+name+'.xml')
+              if not path.exists():
+                  missing.append(name)
+                  continue
+              tree=E.parse(path)
+              cases=tree.findall('.//testcase')
+              failed=[case.attrib.get('name','') for case in cases if case.find('failure') is not None or case.find('error') is not None]
+              canonical_failed_cases.extend(case for case in cases if case.find('failure') is not None or case.find('error') is not None)
+              summaries.append({'report':str(path),'cases':len(cases),'failed_names':failed,'skipped':len(tree.findall('.//skipped'))})
+              failures.extend(failed)
+          baseline_failed_cases=[]
+          for name in ['mcp-log-auth-baseline-lib','mcp-log-auth-baseline-repeat']:
+              path=Path('test-reports')/(name+'.xml')
+              assert path.exists(), 'missing exact-parent comparison '+str(path)
+              tree=E.parse(path)
+              cases=tree.findall('.//testcase')
+              assert cases, 'exact-parent comparison did not execute'
+              baseline_failed_cases.extend(case for case in cases if case.find('failure') is not None or case.find('error') is not None)
+              summaries.append({'report':str(path),'cases':len(cases),'failed_names':[case.attrib.get('name','') for case in cases if case.find('failure') is not None or case.find('error') is not None],'skipped':len(tree.findall('.//skipped'))})
+          def failure_text(case):
+              return '\n'.join((node.text or '') for node in case if node.tag in ['failure','error'])
+          def assertion_signature(case):
+              text=failure_text(case)
+              name=case.attrib.get('name','')
+              if name.startswith('TestMergeGovernanceConfig_'):
+                  values=re.findall(r'configstore\.ComplexityAnalyzerConfigHashes\{[^\n]*\}', text)
+                  assert len(values)==2, 'missing exact expected/actual hashes in '+name
+                  return values
+              if name=='TestConfigSchemaSync':
+                  message="[governance.virtual_keys] Field 'business_unit' in tables.TableVirtualKey but missing from schema"
+                  assert message in text, 'unexpected schema failure'
+                  return [message]
+              if name=='TestLoadConfig_ClientConfigSyncPreservesClientMetadata':
+                  assert 'database is locked' in text, 'unexpected metadata failure'
+                  return ['database is locked']
+              raise AssertionError('unexpected canonical failure '+name)
+          baseline_comparisons=[]
+          for fixed in canonical_failed_cases:
+              name=fixed.attrib.get('name','')
+              signature=assertion_signature(fixed)
+              matching=[case for case in baseline_failed_cases if case.attrib.get('name','')==name and assertion_signature(case)==signature]
+              assert matching, 'canonical failure not reproduced on exact parent in this run: '+name
+              baseline_comparisons.append({'name':name,'exact_parent_failure_matches':len(matching),'assertion_signature':signature})
+          for name in ['mcp-log-auth-handlers','mcp-log-auth-race']:
+              path=Path('test-reports')/(name+'.xml')
+              assert path.exists(), 'missing strict report '+str(path)
+              tree=E.parse(path)
+              cases=tree.findall('.//testcase')
+              assert cases and not tree.findall('.//failure') and not tree.findall('.//error'), 'strict regression failures in '+str(path)
+              assert any(case.attrib.get('name','').startswith('TestDeleteMCPLogs') for case in cases), 'deletion regression did not run'
+              assert not any(case.find('skipped') is not None for case in cases if case.attrib.get('name','').startswith('TestDeleteMCPLogs')), 'deletion regression skipped'
+              summaries.append({'report':str(path),'cases':len(cases),'failed_names':[],'skipped':len(tree.findall('.//skipped'))})
+          if missing:
+              assert failures, 'canonical omitted packages without an observed package failure'
+              assert set(missing).issubset({'server','tests-realtime','websocket'}), 'unexpected omitted canonical package'
+          assert any(item['report'].endswith('http-transport-handlers.xml') and not item['failed_names'] for item in summaries), 'canonical handlers missing or failing'
+          assert any(item['report'].endswith('http-transport-integrations.xml') and not item['failed_names'] for item in summaries), 'canonical integrations missing or failing'
+          summary={'tested_head':'3cc62c4d2cbe79248b83f278cb7dad0de37c6e7a','baseline_head':'e8b579fd1a710753cfa97611b5cff6c3411b0825','reports':summaries,'canonical_missing_directories':missing,'canonical_failed_names':failures,'fresh_baseline_failure_comparisons':baseline_comparisons,'full_canonical_passed':not failures and not missing,'scoped_validation_passed':True,'live_provider_requests':0}
+          Path('test-reports/summary.json').write_text(json.dumps(summary,indent=2)+'\n')
+          print(json.dumps(summary,indent=2))
+          if failures or missing:
+              print('::notice::Scoped offline validation passed; canonical full-suite coverage remains incomplete and its failures reproduced on the exact parent in this run. See summary.json; do not call the full suite green.')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mcp-log-auth-offline-results
+          path: test-reports/
