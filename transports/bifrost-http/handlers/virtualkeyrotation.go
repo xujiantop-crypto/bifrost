@@ -70,6 +70,17 @@ func (r *VirtualKeyRotator) RotateVirtualKey(ctx context.Context, vkID string) (
 	} else {
 		vk.ClearPreviousValue()
 	}
+	// MCP OAuth grants minted in vk mode are bound to this key's row id, not to
+	// its value, so they would keep refreshing under the new value forever, and a
+	// consented code not yet exchanged would mint a fresh grant after the fact.
+	// Rotation is the response to a value that may have leaked, and everything
+	// obtained with that value has to go with it; the cooldown applies to the
+	// retired value itself, not to what was minted from it. Revocation runs first
+	// and in one store transaction: if it fails nothing has been persisted, so
+	// the database and in-memory governance still agree on the old value.
+	if err := r.configStore.RevokeOAuth2GrantsBySubject(ctx, string(schemas.MCPAuthModeVK), vk.ID); err != nil {
+		return nil, fmt.Errorf("failed to revoke the virtual key's MCP OAuth grants, rotation aborted: %w", err)
+	}
 	if err := r.configStore.UpdateVirtualKey(ctx, vk); err != nil {
 		return nil, err
 	}

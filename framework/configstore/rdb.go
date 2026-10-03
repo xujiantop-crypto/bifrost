@@ -9874,6 +9874,29 @@ func (s *RDBConfigStore) RevokeOAuth2RefreshTokensByMode(ctx context.Context, bf
 		Update("revoked_at", &now).Error
 }
 
+// RevokeOAuth2GrantsBySubject revokes every grant bound to one identity (bf_mode +
+// bf_sub) in a single transaction: active refresh tokens are marked revoked, and
+// consented authorization codes that were never exchanged are expired so the code
+// exchange (which checks expires_at) refuses them. Rotating a virtual key uses it
+// so nothing minted with the retired value, redeemed or not, outlives that value.
+// Rows are kept, never deleted, so stolen-token replay detection keeps working.
+func (s *RDBConfigStore) RevokeOAuth2GrantsBySubject(ctx context.Context, bfMode, bfSub string) error {
+	now := time.Now()
+	return s.DB().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&tables.TableOAuth2RefreshToken{}).
+			Where("bf_mode = ? AND bf_sub = ? AND revoked_at IS NULL", bfMode, bfSub).
+			Update("revoked_at", &now).Error; err != nil {
+			return fmt.Errorf("revoke oauth2 refresh tokens: %w", err)
+		}
+		if err := tx.Model(&tables.TableOAuth2AuthorizeRequest{}).
+			Where("bf_mode = ? AND bf_sub = ? AND status = ? AND expires_at > ?", bfMode, bfSub, tables.OAuth2AuthorizeRequestStatusConsented, now).
+			Updates(map[string]any{"expires_at": now, "updated_at": now}).Error; err != nil {
+			return fmt.Errorf("expire oauth2 authorization codes: %w", err)
+		}
+		return nil
+	})
+}
+
 // SweepOAuth2RefreshTokens deletes revoked refresh tokens older than the given
 // duration. Active tokens are never swept — only revoked ones that are past
 // their retention window.

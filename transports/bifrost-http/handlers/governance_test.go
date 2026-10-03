@@ -65,6 +65,16 @@ type mockRotateConfigStore struct {
 	clientConfigErr error
 	updates         int
 	updateErr       error
+	revokedGrants   []string // "<bf_mode>:<bf_sub>" per grant-revocation call
+	revokeErr       error
+}
+
+func (m *mockRotateConfigStore) RevokeOAuth2GrantsBySubject(_ context.Context, bfMode, bfSub string) error {
+	if m.revokeErr != nil {
+		return m.revokeErr
+	}
+	m.revokedGrants = append(m.revokedGrants, bfMode+":"+bfSub)
+	return nil
 }
 
 func (m *mockRotateConfigStore) GetClientConfig(_ context.Context) (*configstore.ClientConfig, error) {
@@ -1464,6 +1474,9 @@ func TestRotateVirtualKey_OnlyChangesValueAndReloads(t *testing.T) {
 
 	if ctx.Response.StatusCode() != 200 {
 		t.Fatalf("expected status 200, got %d: %s", ctx.Response.StatusCode(), string(ctx.Response.Body()))
+	}
+	if len(store.revokedGrants) != 1 || store.revokedGrants[0] != "vk:vk-1" {
+		t.Fatalf("expected the rotated key's vk-mode OAuth grants to be revoked, got %v", store.revokedGrants)
 	}
 	if store.updates != 1 {
 		t.Fatalf("expected one update, got %d", store.updates)
