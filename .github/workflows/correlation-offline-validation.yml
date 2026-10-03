@@ -1,0 +1,76 @@
+name: Correlation headers offline validation
+on:
+  push:
+    branches: [test/provider-correlation-validation]
+permissions:
+  contents: read
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 2994faca840f46a4a934c2b423c3f13ec7a74202
+          fetch-depth: 0
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: transports/go.mod
+          cache-dependency-path: |
+            core/go.sum
+            framework/go.sum
+            transports/go.sum
+            plugins/*/go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Verify exact tested source and set up local modules
+        run: |
+          test "$(git rev-parse HEAD)" = '2994faca840f46a4a934c2b423c3f13ec7a74202'
+          go work init ./core ./framework ./transports
+          for d in plugins/*; do test ! -f "$d/go.mod" || go work use "./$d"; done
+          mkdir -p test-reports
+      - name: Canonical HTTP transport tests
+        run: make test-http-transport
+      - name: Relevant regression tests with race detector and strict exit
+        if: always()
+        working-directory: transports
+        run: |
+          gotestsum --format standard-verbose --junitfile ../test-reports/correlation-scoped.xml -- -race -count=1 -timeout 10m -run '^(TestForwardProviderResponseHeaders_CorrelationPrecedence|TestTracingMiddleware_(SetsCorrelationHeaders|ProviderHeadersPreserveCorrelation)|TestSendError_ProviderHeadersPreserveCorrelation|TestTryStreamLargeResponse_AppliesRoutedIdentityHeaders|TestWriteRealtimeClientSecretResponse_PreservesCorrelation|TestProviderCorrelationHeaders_IntegrationAndPassthroughWire|TestTransportHooks_CanExplicitlyReplaceCorrelation|TestApplyBifrost.*ResponseHeaders|TestTransportResponseHeadersHook.*|TestResponseHeadersHookAppliedBeforeSSEStreamStarts)$' ./bifrost-http/lib ./bifrost-http/handlers ./bifrost-http/integrations
+      - name: Vet and formatting
+        if: always()
+        working-directory: transports
+        run: |
+          go vet ./bifrost-http/lib ./bifrost-http/handlers ./bifrost-http/integrations
+          test -z "$(gofmt -l bifrost-http/handlers/inference.go bifrost-http/handlers/middlewares_test.go bifrost-http/handlers/realtime_client_secrets.go bifrost-http/handlers/realtime_client_secrets_test.go bifrost-http/integrations/router.go bifrost-http/integrations/router_test.go bifrost-http/integrations/utils.go bifrost-http/integrations/utils_test.go bifrost-http/lib/responseheaders.go bifrost-http/lib/responseheaders_test.go)"
+      - name: Provider harness structure and fixture syntax
+        if: always()
+        run: |
+          node --check tests/e2e/api/runners/run-correlation-header-mock.mjs
+          node tests/e2e/api/runners/augment-provider-harness.mjs --source tests/e2e/api/collections/provider-harness.json --out /tmp/correlation-augmented.json
+          node tests/e2e/api/runners/filter-collection.mjs --source /tmp/correlation-augmented.json --out /tmp/correlation-filtered.json --provider openai --feature 'gateway correlation headers'
+          node -e "const c=require('/tmp/correlation-filtered.json'); function count(items){return items.reduce((n,i)=>n+(i.item?count(i.item):1),0)}; if(count(c.item)!==4) throw new Error('correlation regression cases missing');"
+      - name: Assert canonical JUnit results and regression presence
+        if: always()
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as E
+          files=list(Path('.').glob('**/test-reports/*.xml'))
+          assert files, 'no JUnit reports'
+          total=0
+          for file in files:
+              tree=E.parse(file)
+              cases=tree.findall('.//testcase')
+              total+=len(cases)
+              assert not tree.findall('.//failure') and not tree.findall('.//error'), f'failing cases in {file}'
+          scoped=E.parse('test-reports/correlation-scoped.xml')
+          names=[c.attrib['name'] for c in scoped.findall('.//testcase')]
+          assert any('ProviderHeadersPreserveCorrelation' in n for n in names), 'regression not executed'
+          print(f'{len(files)} reports; {total} cases; no failures/errors')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: correlation-offline-results
+          path: '**/test-reports/*.xml'
