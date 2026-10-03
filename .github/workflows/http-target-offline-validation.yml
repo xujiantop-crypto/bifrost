@@ -15,11 +15,11 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          ref: 478544472a114276922a19997e9ee002f0369d4d
+          ref: 1e4e17678e7bbac0356371abfda8d90eb2e6546a
           fetch-depth: 0
       - name: Verify exact source and platform tools
         run: |
-          test "$(git rev-parse HEAD)" = '478544472a114276922a19997e9ee002f0369d4d'
+          test "$(git rev-parse HEAD)" = '1e4e17678e7bbac0356371abfda8d90eb2e6546a'
           test "$(git rev-parse HEAD^)" = 'e8b579fd1a710753cfa97611b5cff6c3411b0825'
           make --version
           bash --version
@@ -80,11 +80,11 @@ jobs:
           (output / 'result.json').write_text(json.dumps(proof, indent=2) + '\n')
           fixed = proof['runs']['fixed']
           parent = proof['runs']['parent']
-          assert fixed['methods'] == parent['methods'] == 7
+          assert fixed['methods'] == parent['methods'] == 9
           assert not fixed['errors'] and not fixed['failures']
-          assert len(fixed['leaves']) == 11 and all(x['passed'] for x in fixed['leaves'])
-          assert not parent['errors'] and len(parent['failures']) == 10
-          assert len(parent['leaves']) == 11 and sum(x['passed'] for x in parent['leaves']) == 1
+          assert len(fixed['leaves']) == 13 and all(x['passed'] for x in fixed['leaves'])
+          assert not parent['errors'] and len(parent['failures']) == 12
+          assert len(parent['leaves']) == 13 and sum(x['passed'] for x in parent['leaves']) == 1
           assert all('AssertionError' in x['trace'] for x in parent['failures'])
           assert next(x for x in parent['leaves'] if x['id'].endswith('test_empty_transport_directory_is_not_an_error'))['passed']
           PY
