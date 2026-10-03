@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 0e7377d2e137e084c39a83c6c70ae102782a5f1d
+          ref: 8c8a3e398e903810db73e512738868b59e89329b
           fetch-depth: 0
       - uses: actions/setup-go@v6
         with:
@@ -29,12 +29,14 @@ jobs:
         working-directory: core
         run: |
           go vet ./providers/huggingface
-          test -z "$(gofmt -l providers/huggingface/utils.go providers/huggingface/models_test.go)"
+          test -z "$(gofmt -l providers/huggingface/utils.go providers/huggingface/huggingface.go providers/huggingface/models.go providers/huggingface/models_test.go)"
       - name: Provider harness structure
         run: |
           node tests/e2e/api/runners/augment-provider-harness.mjs --source tests/e2e/api/collections/provider-harness.json --out /tmp/hf-augmented.json
           node tests/e2e/api/runners/filter-collection.mjs --source /tmp/hf-augmented.json --out /tmp/hf-filtered.json --provider huggingface --feature 'DeepInfra model discovery'
           node -e "const c=require('/tmp/hf-filtered.json'); const f=c.item.find(i=>i.name.includes('DeepInfra model discovery')); if(!f || f.item.length!==1) throw new Error('regression case did not survive filtering');"
+          node tests/e2e/api/runners/filter-collection.mjs --source /tmp/hf-augmented.json --out /tmp/hf-legacy-filtered.json --provider huggingface --feature 'legacy provider model backfill'
+          node -e "const c=require('/tmp/hf-legacy-filtered.json'); const f=c.item.find(i=>i.name.includes('configured provider model IDs')); if(!f || f.item.length!==2) throw new Error('configured-ID cases did not survive filtering');"
       - name: Normalize report filename for artifact upload
         if: always()
         run: cp test-reports/*.xml /tmp/huggingface-units.xml
