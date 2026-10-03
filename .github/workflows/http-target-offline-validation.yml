@@ -1,0 +1,99 @@
+name: HTTP transport Make target offline validation
+on:
+  push:
+    branches: [test/http-transport-target-validation]
+permissions:
+  contents: read
+jobs:
+  offline:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: 478544472a114276922a19997e9ee002f0369d4d
+          fetch-depth: 0
+      - name: Verify exact source and platform tools
+        run: |
+          test "$(git rev-parse HEAD)" = '478544472a114276922a19997e9ee002f0369d4d'
+          test "$(git rev-parse HEAD^)" = 'e8b579fd1a710753cfa97611b5cff6c3411b0825'
+          make --version
+          bash --version
+          python3 --version
+      - name: Actual GNU make regression and exact-parent red proof
+        run: |
+          mkdir -p offline-proof
+          python3 - <<'PY'
+          import importlib.util
+          import io
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import unittest
+
+          root = Path.cwd()
+          output = root / 'offline-proof'
+          baseline = output / 'parent.Makefile'
+          baseline.write_bytes(subprocess.check_output(['git', 'show', 'HEAD^:Makefile']))
+          proof = {'source': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
+                   'parent': subprocess.check_output(['git', 'rev-parse', 'HEAD^'], text=True).strip(),
+                   'platform': os.uname().sysname, 'runs': {}}
+
+          class EvidenceResult(unittest.TextTestResult):
+              def __init__(self, *args):
+                  super().__init__(*args)
+                  self.subtest_parents = set()
+                  self.leaves = []
+              def addSubTest(self, test, subtest, err):
+                  self.subtest_parents.add(test.id())
+                  self.leaves.append({'id': subtest.id(), 'passed': err is None})
+                  super().addSubTest(test, subtest, err)
+              def addSuccess(self, test):
+                  if test.id() not in self.subtest_parents:
+                      self.leaves.append({'id': test.id(), 'passed': True})
+                  super().addSuccess(test)
+              def addFailure(self, test, err):
+                  self.leaves.append({'id': test.id(), 'passed': False})
+                  super().addFailure(test, err)
+              def addError(self, test, err):
+                  self.leaves.append({'id': test.id(), 'passed': False})
+                  super().addError(test, err)
+
+          for label, makefile in [('fixed', root / 'Makefile'), ('parent', baseline)]:
+              os.environ['BIFROST_TEST_MAKEFILE'] = str(makefile)
+              spec = importlib.util.spec_from_file_location(label, root / '.github/workflows/scripts/test-http-transport-target.py')
+              module = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(module)
+              stream = io.StringIO()
+              suite = unittest.defaultTestLoader.loadTestsFromModule(module)
+              result = unittest.TextTestRunner(stream=stream, verbosity=2, resultclass=EvidenceResult).run(suite)
+              (output / (label + '.log')).write_text(stream.getvalue())
+              proof['runs'][label] = {'methods': result.testsRun, 'leaves': result.leaves,
+                                      'failures': [{'id': t.id(), 'trace': trace} for t, trace in result.failures],
+                                      'errors': [{'id': t.id(), 'trace': trace} for t, trace in result.errors]}
+              print(label, stream.getvalue())
+          (output / 'result.json').write_text(json.dumps(proof, indent=2) + '\n')
+          fixed = proof['runs']['fixed']
+          parent = proof['runs']['parent']
+          assert fixed['methods'] == parent['methods'] == 7
+          assert not fixed['errors'] and not fixed['failures']
+          assert len(fixed['leaves']) == 11 and all(x['passed'] for x in fixed['leaves'])
+          assert not parent['errors'] and len(parent['failures']) == 10
+          assert len(parent['leaves']) == 11 and sum(x['passed'] for x in parent['leaves']) == 1
+          assert all('AssertionError' in x['trace'] for x in parent['failures'])
+          assert next(x for x in parent['leaves'] if x['id'].endswith('test_empty_transport_directory_is_not_an_error'))['passed']
+          PY
+      - name: Compile regression script and check whitespace
+        run: |
+          python3 -m py_compile .github/workflows/scripts/test-http-transport-target.py
+          git diff --check HEAD^
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: http-target-offline-${{ matrix.os }}
+          path: offline-proof/
