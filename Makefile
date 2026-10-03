@@ -954,22 +954,25 @@ print-test-summary:
 test-http-transport: install-gotestsum ## Run HTTP transport tests
 	@$(EXPOSE_ENV); \
 	$(ECHO) "$(GREEN)Running HTTP transport tests...$(NC)"; \
-	mkdir -p $(TEST_REPORTS_DIR); \
-	cd transports/bifrost-http && find . -name "*.go" -path "*/tests/*" -o -name "*_test.go" | head -1 > /dev/null && \
+	mkdir -p "$(TEST_REPORTS_DIR)" || exit 1; \
+	report_dir=$$(cd "$(TEST_REPORTS_DIR)" && pwd) || exit 1; \
+	failed=0; \
+	cd transports/bifrost-http || exit 1; \
 		for dir in $$(find . -name "*_test.go" -exec dirname {} \; | sort -u); do \
 			pkg_name=$$(echo $$dir | sed 's|^\./||' | sed 's|/|-|g'); \
 			$(ECHO) "Testing $$dir..."; \
-			cd $$dir && gotestsum \
+			( cd "$$dir" && gotestsum \
 				--format=$(GOTESTSUM_FORMAT) \
-				--junitfile=../../../$(TEST_REPORTS_DIR)/http-transport-$$pkg_name.xml \
-				-- -v ./... && cd - > /dev/null; \
+				--junitfile="$$report_dir/http-transport-$$pkg_name.xml" \
+				-- -v ./... ) || failed=1; \
 			if [ -z "$$CI" ] && [ -z "$$GITHUB_ACTIONS" ] && [ -z "$$GITLAB_CI" ] && [ -z "$$CIRCLECI" ] && [ -z "$$JENKINS_HOME" ]; then \
 				if which junit-viewer > /dev/null 2>&1; then \
 					$(ECHO) "$(YELLOW)Generating HTML report for $$pkg_name...$(NC)"; \
-					junit-viewer --results=../../$(TEST_REPORTS_DIR)/http-transport-$$pkg_name.xml --save=../../$(TEST_REPORTS_DIR)/http-transport-$$pkg_name.html 2>/dev/null || true; \
+					junit-viewer --results="$$report_dir/http-transport-$$pkg_name.xml" --save="$$report_dir/http-transport-$$pkg_name.html" 2>/dev/null || true; \
 				fi; \
 			fi; \
-		done || $(ECHO) "No HTTP transport tests found"
+		done; \
+	exit $$failed
 	@$(ECHO) ""
 	@if [ -z "$$CI" ] && [ -z "$$GITHUB_ACTIONS" ] && [ -z "$$GITLAB_CI" ] && [ -z "$$CIRCLECI" ] && [ -z "$$JENKINS_HOME" ]; then \
 		$(ECHO) "$(CYAN)HTML reports saved to $(TEST_REPORTS_DIR)/http-transport-*.html$(NC)"; \
