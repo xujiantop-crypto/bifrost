@@ -1,0 +1,58 @@
+name: Hugging Face offline validation
+on:
+  push:
+    branches: [test/huggingface-hub-organizations]
+permissions:
+  contents: read
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 423828056b6d07ecd26b8a91e7c4797cb6d7b611
+          fetch-depth: 0
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: core/go.mod
+          cache-dependency-path: core/go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Canonical provider unit tests
+        run: make test-core PROVIDER=huggingface PATTERN='^(TestTo|TestListModelsByKey|TestHuggingFaceSendsDoneMarker|TestParseHuggingFaceImageError|TestPayloadOrdering|TestResponseFormat)'
+      - name: All Hugging Face units with race detector
+        working-directory: core
+        run: go test ./providers/huggingface -skip '^TestHuggingface$' -race -count=1 -v
+      - name: Vet and formatting
+        working-directory: core
+        run: |
+          go vet ./providers/huggingface
+          test -z "$(gofmt -l providers/huggingface/utils.go providers/huggingface/huggingface.go providers/huggingface/models.go providers/huggingface/models_test.go)"
+      - name: Provider harness structure
+        run: |
+          node tests/e2e/api/runners/augment-provider-harness.mjs --source tests/e2e/api/collections/provider-harness.json --out /tmp/hf-augmented.json
+          node tests/e2e/api/runners/filter-collection.mjs --source /tmp/hf-augmented.json --out /tmp/hf-filtered.json --provider huggingface --feature 'DeepInfra model discovery'
+          node -e "const c=require('/tmp/hf-filtered.json'); const f=c.item.find(i=>i.name.includes('DeepInfra model discovery')); if(!f || f.item.length!==1) throw new Error('regression case did not survive filtering');"
+          node tests/e2e/api/runners/filter-collection.mjs --source /tmp/hf-augmented.json --out /tmp/hf-legacy-filtered.json --provider huggingface --feature 'legacy provider model backfill'
+          node -e "const c=require('/tmp/hf-legacy-filtered.json'); const f=c.item.find(i=>i.name.includes('configured provider model IDs')); if(!f || f.item.length!==2) throw new Error('configured-ID cases did not survive filtering');"
+      - name: Provider-named Hub organization harness structure
+        run: |
+          node tests/e2e/api/runners/filter-collection.mjs --source /tmp/hf-augmented.json --out /tmp/hf-org-filtered.json --provider huggingface --feature 'provider named Hub organizations'
+          node -e "const c=require('/tmp/hf-org-filtered.json'); const f=c.item.find(i=>i.name.includes('configured provider model IDs')); if(!f || f.item.length!==1) throw new Error('provider-named Hub case did not survive filtering');"
+      - name: Pinned noctx analyzer
+        working-directory: core
+        run: |
+          go install github.com/sonatard/noctx/cmd/noctx@v0.4.0
+          go vet -vettool="$(go env GOPATH)/bin/noctx" ./providers/huggingface > /tmp/hf-noctx.txt 2>&1
+          cat /tmp/hf-noctx.txt
+          if rg '"message"' /tmp/hf-noctx.txt; then exit 1; fi
+      - name: Normalize report filename for artifact upload
+        if: always()
+        run: cp test-reports/*.xml /tmp/huggingface-units.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: huggingface-offline-results
+          path: /tmp/huggingface-units.xml
