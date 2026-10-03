@@ -1,0 +1,66 @@
+name: Correlation baseline validation
+on:
+  push:
+    branches: [test/provider-correlation-baseline]
+permissions:
+  contents: read
+jobs:
+  baseline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: e8b579fd1a710753cfa97611b5cff6c3411b0825
+          fetch-depth: 0
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: transports/go.mod
+          cache-dependency-path: |
+            core/go.sum
+            framework/go.sum
+            transports/go.sum
+            plugins/*/go.sum
+      - name: Verify exact baseline and local modules
+        run: |
+          test "$(git rev-parse HEAD)" = e8b579fd1a710753cfa97611b5cff6c3411b0825
+          go work init ./core ./framework ./transports
+          for d in plugins/*; do test ! -f "$d/go.mod" || go work use "./$d"; done
+          go install gotest.tools/gotestsum@latest
+          mkdir -p test-reports
+      - name: Entire baseline lib package; retain actual exit and JUnit
+        working-directory: transports
+        run: |
+          set +e
+          gotestsum --format standard-verbose --junitfile ../test-reports/baseline-lib.xml -- -count=1 -timeout 10m ./bifrost-http/lib
+          rc=$?
+          printf '%s\n' "$rc" > ../test-reports/baseline-lib-exit.txt
+          exit 0
+      - name: Isolated baseline failures repeated to check SQLite stability
+        working-directory: transports
+        run: |
+          set +e
+          gotestsum --format standard-verbose --junitfile ../test-reports/baseline-config-repeat.xml -- -count=3 -timeout 10m -run '^(TestMergeGovernanceConfig_AppliesComplexityAnalyzerConfigWhenHashesAreEmpty|TestMergeGovernanceConfig_PreservesComplexityAnalyzerConfigWhenSectionHashesMatch|TestMergeGovernanceConfig_MergesComplexityKeywordsWhenSectionHashesChange|TestMergeGovernanceConfig_SourceOfTruthConfigJSONUsesComplexityFileConfig|TestConfigSchemaSync|TestLoadConfig_ClientConfigSyncPreservesClientMetadata)$' ./bifrost-http/lib
+          rc=$?
+          printf '%s\n' "$rc" > ../test-reports/baseline-config-repeat-exit.txt
+          exit 0
+      - name: Verify the unrelated failures actually predate the fix
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as E
+          expected=set('TestMergeGovernanceConfig_AppliesComplexityAnalyzerConfigWhenHashesAreEmpty,TestMergeGovernanceConfig_PreservesComplexityAnalyzerConfigWhenSectionHashesMatch,TestMergeGovernanceConfig_MergesComplexityKeywordsWhenSectionHashesChange,TestMergeGovernanceConfig_SourceOfTruthConfigJSONUsesComplexityFileConfig,TestConfigSchemaSync'.split(','))
+          full=E.parse('test-reports/baseline-lib.xml')
+          failures={c.attrib['name'] for c in full.findall('.//testcase') if c.find('failure') is not None or c.find('error') is not None}
+          assert expected <= failures, f'deterministic failures not reproduced: {expected-failures}'
+          print('Baseline lib actual failures:', sorted(failures))
+          repeat=E.parse('test-reports/baseline-config-repeat.xml')
+          rf=[c.attrib['name'] for c in repeat.findall('.//testcase') if c.find('failure') is not None or c.find('error') is not None]
+          print('Repeated isolated baseline failures:', rf)
+          Path('test-reports/baseline-summary.txt').write_text('Full baseline failures: '+str(sorted(failures))+'\nRepeated baseline failures: '+str(rf)+'\n')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: correlation-baseline-results
+          path: test-reports/*
