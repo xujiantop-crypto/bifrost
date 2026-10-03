@@ -1155,6 +1155,7 @@ func virtualKeyFromHeaders(ctx *fasthttp.RequestCtx) string {
 type AuthMiddleware struct {
 	store             configstore.ConfigStore
 	whitelistedRoutes atomic.Pointer[[]string]
+	allowedOrigins    atomic.Pointer[[]string] // client_config.allowed_origins; read while auth is disabled
 	authConfig        atomic.Pointer[configstore.AuthConfig]
 	wsTicketStore     *WSTicketStore
 	tempTokensService *temptoken.Service // optional; when nil, temp-token fallback is disabled
@@ -1222,6 +1223,7 @@ func InitAuthMiddleware(store configstore.ConfigStore, wsTicketStore *WSTicketSt
 	clientConfig, err := store.GetClientConfig(context.Background())
 	if err == nil && clientConfig != nil {
 		am.whitelistedRoutes.Store(&clientConfig.WhitelistedRoutes)
+		am.allowedOrigins.Store(&clientConfig.AllowedOrigins)
 		am.tempTokensEnabled.Store(clientConfig.MCPEnableTempTokenAuth)
 	} else {
 		emptyRoutes := []string{}
@@ -1274,6 +1276,50 @@ func (m *AuthMiddleware) CheckConfiguredSetupToken(token string) bool {
 // UpdateWhitelistedRoutes updates the configured whitelisted routes that bypass auth middleware.
 func (m *AuthMiddleware) UpdateWhitelistedRoutes(routes []string) {
 	m.whitelistedRoutes.Store(&routes)
+}
+
+// UpdateAllowedOrigins updates the allowed origins the auth-disabled branch consults
+// (see refuseCrossOriginWhileAuthDisabled). Called alongside UpdateWhitelistedRoutes
+// whenever the client config is reloaded.
+func (m *AuthMiddleware) UpdateAllowedOrigins(origins []string) {
+	m.allowedOrigins.Store(&origins)
+}
+
+// originExplicitlyAllowed reports whether origin is a localhost origin or matches an
+// allowed_origins entry other than the bare "*" wildcard. A "*.example.com" pattern
+// counts as explicit: the operator named that domain.
+func originExplicitlyAllowed(origin string, allowedOrigins []string) bool {
+	if isLocalhostOrigin(origin) {
+		return true
+	}
+	explicit := slices.DeleteFunc(slices.Clone(allowedOrigins), func(entry string) bool { return entry == "*" })
+	return IsOriginAllowed(origin, explicit)
+}
+
+// refuseCrossOriginWhileAuthDisabled closes the one browser path into the open
+// management API. With dashboard auth disabled the API is intentionally reachable
+// by anyone who can route to the port, on the assumption that network position is
+// the control. A web page the operator visits has that position too, and the
+// default allowed_origins of "*" would let it read and change the config from any
+// origin. So while auth is disabled, a request carrying an Origin header reaches a
+// management route only from a localhost origin or one the operator listed by name;
+// the bare "*" does not count. Requests without an Origin (CLI, SDKs, same-origin
+// dashboard navigation) and inference routes are unaffected. Returns true if the
+// request was refused (the error response has already been written).
+func (m *AuthMiddleware) refuseCrossOriginWhileAuthDisabled(ctx *fasthttp.RequestCtx) bool {
+	origin := string(ctx.Request.Header.Peek("Origin"))
+	if origin == "" {
+		return false
+	}
+	var allowed []string
+	if stored := m.allowedOrigins.Load(); stored != nil {
+		allowed = *stored
+	}
+	if originExplicitlyAllowed(origin, allowed) {
+		return false
+	}
+	SendError(ctx, fasthttp.StatusForbidden, fmt.Sprintf("Cross-origin requests to the management API from %q are refused while dashboard auth is disabled; enable dashboard authentication, or list the origin explicitly in client_config.allowed_origins (localhost origins are always allowed).", origin))
+	return true
 }
 
 // UpdateTempTokenAuthEnabled updates whether scoped temp-token fallback auth is accepted.
@@ -1441,8 +1487,16 @@ func (m *AuthMiddleware) middleware(shouldSkip func(*configstore.AuthConfig, str
 				return
 			}
 			authConfig := m.authConfig.Load()
+			// Match the whitelist against the RAW request path (PathOriginal); see the comment below.
+			url := string(ctx.Request.URI().PathOriginal())
 			if authConfig == nil || !authConfig.IsEnabled {
 				// logger.Debug("auth middleware is disabled because auth config is not present or not enabled")
+				// The open management API is still not a cross-origin one: a browser
+				// page from an unlisted origin is refused, while whitelisted routes
+				// (health, login, assets) and inference routes keep today's behaviour.
+				if !allowVirtualKeyAuth && !shouldSkip(authConfig, url) && m.refuseCrossOriginWhileAuthDisabled(ctx) {
+					return
+				}
 				ctx.SetUserValue(schemas.BifrostContextKeySessionToken, "")
 				// Mark as local admin so downstream RBAC bypasses cleanly when
 				// auth is fully disabled; otherwise RBAC 401s and the UI enters
@@ -1468,7 +1522,6 @@ func (m *AuthMiddleware) middleware(shouldSkip func(*configstore.AuthConfig, str
 			// while the router dispatched it to a protected, parameterized admin handler.
 			// Using the same raw string the router uses keeps this decision congruent with
 			// router dispatch for every route, not just the specific one in a given PoC.
-			url := string(ctx.Request.URI().PathOriginal())
 			// We skip authorization for the login route
 			if shouldSkip(authConfig, url) {
 				// No credential was checked, so handlers that gate on genuine auth
