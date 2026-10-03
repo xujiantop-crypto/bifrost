@@ -1,0 +1,376 @@
+name: Complexity file presence offline validation
+on:
+  push:
+    branches: [test/complexity-file-presence-validation]
+permissions:
+  contents: read
+env:
+  TESTED_HEAD: 97401c23c32759ff7a11f1586f9c3d85d30354d6
+  BASELINE_HEAD: e8b579fd1a710753cfa97611b5cff6c3411b0825
+  GOTELEMETRY: 'off'
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 97401c23c32759ff7a11f1586f9c3d85d30354d6
+          fetch-depth: 0
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: transports/go.mod
+          cache-dependency-path: |
+            core/go.sum
+            framework/go.sum
+            transports/go.sum
+            plugins/*/go.sum
+      - name: Verify exact source and prepare the parent overlay
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$TESTED_HEAD"
+          test "$(git rev-parse HEAD^)" = "$BASELINE_HEAD"
+          go work init ./core ./framework ./transports
+          for d in plugins/*; do test ! -f "$d/go.mod" || go work use "./$d"; done
+          mkdir -p test-reports
+          git show "$BASELINE_HEAD:transports/bifrost-http/lib/config.go" > /tmp/classifier-baseline-config.go
+          python - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          def git(*args):
+              return subprocess.check_output(['git', *args], text=True).strip()
+          changed=git('diff','--name-only',os.environ['BASELINE_HEAD'],'HEAD').splitlines()
+          paths=['framework/configstore/complexityconfig.go','framework/configstore/rdb.go','plugins/routing/complexity/config.go','transports/config.schema.json']
+          unchanged=[]
+          for path in paths:
+              before=git('rev-parse',os.environ['BASELINE_HEAD']+':'+path)
+              after=git('rev-parse','HEAD:'+path)
+              unchanged.append({'path':path,'baseline_blob':before,'tested_blob':after,'unchanged':before==after})
+          source=Path('transports/bifrost-http/lib/config.go').resolve()
+          Path('/tmp/classifier-baseline-overlay.json').write_text(json.dumps({'Replace':{str(source):'/tmp/classifier-baseline-config.go'}})+'\n')
+          root=Path('transports/bifrost-http')
+          expected=sorted({str(path.parent.relative_to(root)).replace('/','-') for path in root.rglob('*_test.go')})
+          metadata={'tested_head':git('rev-parse','HEAD'),'tested_parent':git('rev-parse','HEAD^'),'baseline_head':os.environ['BASELINE_HEAD'],
+                    'changed_files':changed,'changed_production_go':sorted(path for path in changed if path.endswith('.go') and not path.endswith('_test.go')),
+                    'unchanged_dependency_blobs':unchanged,'canonical_expected_directories':expected,
+                    'go_version':subprocess.check_output(['go','version'],text=True).strip(),
+                    'go_env':json.loads(subprocess.check_output(['go','env','-json','CGO_ENABLED','GOOS','GOARCH','GOWORK'],text=True))}
+          Path('test-reports/sources.json').write_text(json.dumps(metadata,indent=2)+'\n')
+          manifest=json.loads(r'''{"roots":["TestMergeGovernanceConfig_ComplexityFilePresence","TestLoadConfig_ComplexityFilePresence"],"cases":["TestMergeGovernanceConfig_ComplexityFilePresence/omitted_classifier_with_legacy_hash","TestMergeGovernanceConfig_ComplexityFilePresence/omitted_classifier_after_explicit_jev_file","TestMergeGovernanceConfig_ComplexityFilePresence/omitted_classifier_with_prior_normalized_hash","TestMergeGovernanceConfig_ComplexityFilePresence/explicit_semantic_replaces_jev","TestMergeGovernanceConfig_ComplexityFilePresence/explicit_jev_preserves_omitted_jev_settings","TestMergeGovernanceConfig_ComplexityFilePresence/semantic_fallback_preserves_omitted_jev_settings","TestMergeGovernanceConfig_ComplexityFilePresence/explicit_jev_settings_apply","TestMergeGovernanceConfig_ComplexityFilePresence/explicit_empty_jev_applies_defaults","TestMergeGovernanceConfig_ComplexityFilePresence/classifier_case_and_space_normalize","TestMergeGovernanceConfig_ComplexityFilePresence/explicit_blank_classifier_defaults_to_semantic","TestMergeGovernanceConfig_ComplexityFilePresence/invalid_classifier_leaves_database_untouched","TestMergeGovernanceConfig_ComplexityFilePresence/new_analyzer_defaults_to_semantic","TestMergeGovernanceConfig_ComplexityFilePresence/config_json_defaults_to_semantic","TestMergeGovernanceConfig_ComplexityFilePresence/missing_analyzer_section_preserves_jev","TestLoadConfig_ComplexityFilePresence/omitted_classifier_with_legacy_hash","TestLoadConfig_ComplexityFilePresence/omitted_classifier_after_explicit_jev_file","TestLoadConfig_ComplexityFilePresence/explicit_jev_preserves_omitted_jev_settings"],"red_required_failures":["TestMergeGovernanceConfig_ComplexityFilePresence/omitted_classifier_with_legacy_hash","TestMergeGovernanceConfig_ComplexityFilePresence/omitted_classifier_after_explicit_jev_file","TestMergeGovernanceConfig_ComplexityFilePresence/explicit_jev_preserves_omitted_jev_settings","TestMergeGovernanceConfig_ComplexityFilePresence/classifier_case_and_space_normalize","TestMergeGovernanceConfig_ComplexityFilePresence/semantic_fallback_preserves_omitted_jev_settings","TestLoadConfig_ComplexityFilePresence/omitted_classifier_with_legacy_hash","TestLoadConfig_ComplexityFilePresence/omitted_classifier_after_explicit_jev_file","TestLoadConfig_ComplexityFilePresence/explicit_jev_preserves_omitted_jev_settings"],"red_assertion_patterns":{"TestMergeGovernanceConfig_ComplexityFilePresence/omitted_classifier_with_legacy_hash":["expected:\\s*\"jev\"","actual\\s*:\\s*\"semantic\""],"TestMergeGovernanceConfig_ComplexityFilePresence/omitted_classifier_after_explicit_jev_file":["expected:\\s*\"jev\"","actual\\s*:\\s*\"semantic\""],"TestMergeGovernanceConfig_ComplexityFilePresence/explicit_jev_preserves_omitted_jev_settings":["expected:\\s*5","actual\\s*:\\s*1"],"TestMergeGovernanceConfig_ComplexityFilePresence/classifier_case_and_space_normalize":["expected:\\s*5","actual\\s*:\\s*1"],"TestMergeGovernanceConfig_ComplexityFilePresence/semantic_fallback_preserves_omitted_jev_settings":["expected:\\s*5","actual\\s*:\\s*1"],"TestLoadConfig_ComplexityFilePresence/omitted_classifier_with_legacy_hash":["expected:\\s*\"jev\"","actual\\s*:\\s*\"semantic\""],"TestLoadConfig_ComplexityFilePresence/omitted_classifier_after_explicit_jev_file":["expected:\\s*\"jev\"","actual\\s*:\\s*\"semantic\""],"TestLoadConfig_ComplexityFilePresence/explicit_jev_preserves_omitted_jev_settings":["expected:\\s*5","actual\\s*:\\s*1"]}}''')
+          Path('test-reports/expected-new-tests.json').write_text(json.dumps(manifest,indent=2)+'\n')
+          assert set(changed)=={'transports/bifrost-http/lib/config.go','transports/bifrost-http/lib/config_test.go','transports/changelog.md'},changed
+          assert metadata['changed_production_go']==['transports/bifrost-http/lib/config.go'],metadata
+          assert all(item['unchanged'] for item in unchanged),unchanged
+          assert metadata['go_env']['CGO_ENABLED']=='1',metadata['go_env']
+          PY
+          make install-gotestsum
+      - name: Final regressions against the exact parent's config.go
+        working-directory: transports
+        run: |
+          set +e
+          go test -json -count=1 -timeout 10m -overlay=/tmp/classifier-baseline-overlay.json -run '^(TestMergeGovernanceConfig_ComplexityFilePresence|TestLoadConfig_ComplexityFilePresence)$' ./bifrost-http/lib > ../test-reports/classifier-red.jsonl 2>&1
+          printf '%s\n' "$?" > ../test-reports/classifier-red-exit.txt
+          exit 0
+      - name: Attempt the unmodified canonical HTTP target in full
+        if: always()
+        run: |
+          set +e
+          make test-http-transport > test-reports/canonical-http.log 2>&1
+          printf '%s\n' "$?" > test-reports/canonical-http-exit.txt
+          exit 0
+      - name: Fixed regressions, real SQLite restart, race, and downstream offline checks
+        if: always()
+        run: |
+          set -euo pipefail
+          reports="$GITHUB_WORKSPACE/test-reports"
+          run_record() {
+            label="$1"; cwd="$2"; shift 2
+            printf '%q ' "$@" > "$reports/$label-command.txt"
+            printf '\n' >> "$reports/$label-command.txt"
+            set +e
+            (cd "$cwd" && "$@") > "$reports/$label.log" 2>&1
+            result=$?
+            set -e
+            printf '%s\n' "$result" > "$reports/$label-exit.txt"
+          }
+          scope='^(TestMergeGovernanceConfig_.*Complexity|TestLoadConfig_ComplexityFilePresence|TestSchemaComplexity)'
+          run_record classifier-lib-scoped transports gotestsum --format standard-verbose --junitfile "$reports/classifier-lib-scoped.xml" --jsonfile "$reports/classifier-lib-scoped.jsonl" -- -count=3 -timeout 10m -run "$scope" ./bifrost-http/lib
+          run_record classifier-lib-race transports gotestsum --format standard-verbose --junitfile "$reports/classifier-lib-race.xml" --jsonfile "$reports/classifier-lib-race.jsonl" -- -race -count=1 -timeout 10m -run "$scope" ./bifrost-http/lib
+          run_record classifier-framework-complexity framework gotestsum --format standard-verbose --junitfile "$reports/classifier-framework-complexity.xml" --jsonfile "$reports/classifier-framework-complexity.jsonl" -- -count=1 -timeout 10m -run Complexity ./configstore
+          run_record classifier-routing-complexity plugins/routing gotestsum --format standard-verbose --junitfile "$reports/classifier-routing-complexity.xml" --jsonfile "$reports/classifier-routing-complexity.jsonl" -- -count=1 -timeout 10m ./complexity
+          run_record classifier-fixed-lib transports gotestsum --format standard-verbose --junitfile "$reports/classifier-fixed-lib.xml" --jsonfile "$reports/classifier-fixed-lib.jsonl" -- -count=1 -timeout 10m ./bifrost-http/lib
+          run_record classifier-vet-lib transports go vet ./bifrost-http/lib
+          run_record classifier-vet-framework framework go vet ./configstore
+          run_record classifier-vet-routing plugins/routing go vet ./complexity
+          set +e
+          python - <<'PY' > test-reports/classifier-gofmt.log 2>&1
+          import os, subprocess
+          changed=subprocess.check_output(['git','diff','--name-only',os.environ['BASELINE_HEAD'],'HEAD','--','*.go'],text=True).splitlines()
+          assert changed, 'No changed Go files'
+          output=subprocess.check_output(['gofmt','-l',*changed],text=True)
+          print(output,end='')
+          assert not output.strip(), 'Changed Go files are not formatted'
+          PY
+          printf '%s\n' "$?" > test-reports/classifier-gofmt-exit.txt
+          exit 0
+      - name: Fresh exact-parent full lib and failure repeat comparison
+        if: always()
+        run: |
+          set -euo pipefail
+          git worktree add --detach /tmp/bifrost-classifier-parent "$BASELINE_HEAD"
+          cd /tmp/bifrost-classifier-parent
+          test "$(git rev-parse HEAD)" = "$BASELINE_HEAD"
+          go work init ./core ./framework ./transports
+          for d in plugins/*; do test ! -f "$d/go.mod" || go work use "./$d"; done
+          cd transports
+          reports="$GITHUB_WORKSPACE/test-reports"
+          set +e
+          gotestsum --format standard-verbose --junitfile "$reports/classifier-baseline-lib.xml" --jsonfile "$reports/classifier-baseline-lib.jsonl" -- -count=1 -timeout 10m ./bifrost-http/lib > "$reports/classifier-baseline-lib.log" 2>&1
+          printf '%s\n' "$?" > "$reports/classifier-baseline-lib-exit.txt"
+          gotestsum --format standard-verbose --junitfile "$reports/classifier-baseline-repeat.xml" --jsonfile "$reports/classifier-baseline-repeat.jsonl" -- -count=3 -timeout 10m -run '^(TestMergeGovernanceConfig_(AppliesComplexityAnalyzerConfigWhenHashesAreEmpty|PreservesComplexityAnalyzerConfigWhenSectionHashesMatch|MergesComplexityKeywordsWhenSectionHashesChange|SourceOfTruthConfigJSONUsesComplexityFileConfig)|TestConfigSchemaSync|TestLoadConfig_ClientConfigSyncPreservesClientMetadata)$' ./bifrost-http/lib > "$reports/classifier-baseline-repeat.log" 2>&1
+          printf '%s\n' "$?" > "$reports/classifier-baseline-repeat-exit.txt"
+          exit 0
+      - name: Strict structural proof, coverage gaps, and fresh baseline comparisons
+        if: always()
+        run: |
+          python - <<'PY'
+          """Validate raw offline evidence; a successful scope never labels the full suite green."""
+          from collections import Counter
+          import json
+          from pathlib import Path
+          import re
+          import sys
+          import xml.etree.ElementTree as ET
+          
+          REPORTS = Path(sys.argv[1] if len(sys.argv) > 1 else "test-reports")
+          ISSUES = []
+          SUMMARIES = []
+          
+          
+          def check(condition, message):
+              if not condition:
+                  ISSUES.append(message)
+          
+          
+          def read_json(path):
+              try:
+                  return json.loads(path.read_text(encoding="utf-8"))
+              except (OSError, ValueError) as error:
+                  ISSUES.append(f"Cannot read {path.name}: {error}")
+                  return {}
+          
+          
+          def exit_code(label):
+              try:
+                  return int((REPORTS / f"{label}-exit.txt").read_text().strip())
+              except (OSError, ValueError) as error:
+                  ISSUES.append(f"Missing/invalid exit for {label}: {error}")
+                  return None
+          
+          
+          def events_report(label):
+              events = []
+              path = REPORTS / f"{label}.jsonl"
+              try:
+                  for line in path.read_text(encoding="utf-8").splitlines():
+                      if line.startswith("{"):
+                          events.append(json.loads(line))
+              except (OSError, ValueError) as error:
+                  ISSUES.append(f"Missing/invalid JSONL for {label}: {error}")
+              passed = Counter(e["Test"] for e in events if e.get("Action") == "pass" and e.get("Test"))
+              failed = [e["Test"] for e in events if e.get("Action") == "fail" and e.get("Test")]
+              skipped = [e["Test"] for e in events if e.get("Action") == "skip" and e.get("Test")]
+              output = {}
+              for event in events:
+                  name = event.get("Test")
+                  if name and event.get("Output"):
+                      output[name] = output.get(name, "") + event["Output"]
+              packages = [e for e in events if e.get("Action") in ("pass", "fail") and not e.get("Test")]
+              check(bool(passed or failed), f"{label} did not execute tests")
+              check(bool(packages), f"{label} has no completed package event")
+              result = {"label": label, "exit_code": exit_code(label), "pass_counts": dict(passed),
+                        "failed_names": failed, "skipped_names": skipped,
+                        "package_results": [{"package": e.get("Package"), "action": e["Action"]} for e in packages]}
+              SUMMARIES.append(result)
+              return {**result, "output": output}
+          
+          
+          def require_new_tests(report, names, count):
+              roots = [name for name in names if "/" not in name]
+              observed = set(report["pass_counts"]) | set(report["failed_names"]) | set(report["skipped_names"])
+              observed = {name for name in observed if any(name == root or name.startswith(root + "/") for root in roots)}
+              check(observed == set(names), f"{report['label']}: the executed new-test inventory differs from the declared complete manifest")
+              for name in names:
+                  check(report["pass_counts"].get(name, 0) == count,
+                        f"{report['label']}: {name} must pass exactly {count} time(s)")
+                  check(name not in report["failed_names"] and name not in report["skipped_names"],
+                        f"{report['label']}: {name} failed or skipped")
+          
+          
+          def strict_report(label, new_names=(), repeat_count=1):
+              report = events_report(label)
+              check(report["exit_code"] == 0, f"{label} command failed")
+              check(not report["failed_names"], f"{label} contains failed tests")
+              check(not report["skipped_names"], f"{label} contains skipped tests")
+              check(all(e["action"] == "pass" for e in report["package_results"]), f"{label} package failed")
+              require_new_tests(report, new_names, repeat_count)
+              return report
+          
+          
+          def baseline_signature(name, output):
+              if name == "TestConfigSchemaSync":
+                  expected = "[governance.virtual_keys] Field 'business_unit' in tables.TableVirtualKey but missing from schema"
+                  check("Schema sync errors found (1 total):" in output and expected in output,
+                        f"{name} has an unexpected schema failure")
+                  return [expected] if expected in output and "Schema sync errors found (1 total):" in output else None
+              if name == "TestLoadConfig_ClientConfigSyncPreservesClientMetadata":
+                  check("Received unexpected error:" in output and "database is locked" in output,
+                        f"{name} has an unexpected error")
+                  return ["Received unexpected error:", "database is locked"] if "Received unexpected error:" in output and "database is locked" in output else None
+              ISSUES.append(f"Unexpected fixed/canonical failure: {name}")
+              return None
+          
+          
+          def compare_failures(failures, baseline_reports, origin):
+              matches = []
+              for name, output in failures:
+                  signature = baseline_signature(name, output)
+                  sources = []
+                  for baseline in baseline_reports:
+                      if name not in baseline["failed_names"]:
+                          continue
+                      other = baseline["output"].get(name, "")
+                      if signature and all(value in other for value in signature):
+                          if name != "TestConfigSchemaSync" or "Schema sync errors found (1 total):" in other:
+                              sources.append(baseline["label"])
+                  check(bool(sources), f"{origin}: {name} did not reproduce with the same assertion on the exact parent in this run")
+                  matches.append({"origin": origin, "name": name, "signature": signature, "fresh_exact_parent_reports": sources})
+              return matches
+          
+          
+          def xml_report(path):
+              try:
+                  tree = ET.parse(path)
+                  cases = tree.findall(".//testcase")
+                  check(bool(cases), f"{path.name} executed no testcases")
+                  return cases
+              except (OSError, ET.ParseError) as error:
+                  ISSUES.append(f"Missing/invalid XML {path.name}: {error}")
+                  return []
+          
+          
+          def main():
+              sources = read_json(REPORTS / "sources.json")
+              manifest = read_json(REPORTS / "expected-new-tests.json")
+              names = list(dict.fromkeys(manifest.get("roots", []) + manifest.get("cases", [])))
+              check(set(manifest.get("roots", [])) == {"TestMergeGovernanceConfig_ComplexityFilePresence", "TestLoadConfig_ComplexityFilePresence"},
+                    "Both mock-merge and real SQLite close/reopen regression roots must be declared")
+              check(bool(manifest.get("cases")), "The complete new scenario manifest is missing")
+              red_required = manifest.get("red_required_failures", [])
+              check(bool(red_required), "Required pre-fix assertion failures are undeclared")
+              check(sources.get("tested_head") and sources.get("baseline_head") == sources.get("tested_parent"), "Baseline is not the tested commit's exact parent")
+              check(set(sources.get("changed_files", [])) == {"transports/bifrost-http/lib/config.go", "transports/bifrost-http/lib/config_test.go", "transports/changelog.md"},
+                    "The reviewed three-file diff changed")
+              check(sources.get("changed_production_go") == ["transports/bifrost-http/lib/config.go"], "The config.go overlay does not restore every changed production Go file")
+              check(all(item.get("unchanged") for item in sources.get("unchanged_dependency_blobs", [])), "An overlay dependency differs from the exact parent")
+          
+              red = events_report("classifier-red")
+              check(red["exit_code"] == 1, "Pre-fix overlay must exit 1 from assertion failures")
+              check(not red["skipped_names"], "Pre-fix regression skipped")
+              roots = manifest.get("roots", [])
+              check(all(any(name == root or name.startswith(root + "/") for root in roots) for name in red["failed_names"]), "Pre-fix run failed outside the new regressions")
+              for name in red_required:
+                  check(name in red["failed_names"], f"Required pre-fix failure did not execute: {name}")
+              leaf_failures = [name for name in red["failed_names"] if not any(other.startswith(name + "/") for other in red["failed_names"])]
+              check(bool(leaf_failures), "Pre-fix run has no failed assertion leaf")
+              check(set(leaf_failures) == set(red_required), "Pre-fix failure leaves differ from the exact expected assertions; a control failed or a bug did not reproduce")
+              for name in leaf_failures:
+                  output = red["output"].get(name, "")
+                  check(re.search(r"expected:\s*", output) and re.search(r"actual\s*:", output),
+                        f"{name} must fail at the expected/actual assertion, not setup/build/panic")
+                  for expression in manifest.get("red_assertion_patterns", {}).get(name, []):
+                      check(re.search(expression, output), f"{name} lacks required assertion pattern: {expression}")
+              for name in names:
+                  check(name in red["failed_names"] or red["pass_counts"].get(name, 0) == 1,
+                        f"Pre-fix regression scenario did not execute: {name}")
+          
+              scoped = strict_report("classifier-lib-scoped", names, 3)
+              race = strict_report("classifier-lib-race", names)
+              repaired_hash_roots = [
+                  "TestMergeGovernanceConfig_AppliesComplexityAnalyzerConfigWhenHashesAreEmpty",
+                  "TestMergeGovernanceConfig_PreservesComplexityAnalyzerConfigWhenSectionHashesMatch",
+                  "TestMergeGovernanceConfig_MergesComplexityKeywordsWhenSectionHashesChange",
+                  "TestMergeGovernanceConfig_SourceOfTruthConfigJSONUsesComplexityFileConfig",
+              ]
+              for report, count in ((scoped, 3), (race, 1)):
+                  for name in repaired_hash_roots:
+                      check(report["pass_counts"].get(name, 0) == count, f"{report['label']}: prior complexity hash assertion must now pass: {name}")
+              strict_report("classifier-framework-complexity")
+              strict_report("classifier-routing-complexity")
+              for label in ("classifier-vet-lib", "classifier-vet-framework", "classifier-vet-routing", "classifier-gofmt"):
+                  check(exit_code(label) == 0, f"{label} failed")
+          
+              baseline_full = events_report("classifier-baseline-lib")
+              baseline_repeat = events_report("classifier-baseline-repeat")
+              baseline_reports = [baseline_full, baseline_repeat]
+              for report in baseline_reports:
+                  check(report["exit_code"] in (0, 1), f"{report['label']} has a setup/command failure")
+                  check(not report["skipped_names"], f"{report['label']} contains skipped tests")
+              fixed_full = events_report("classifier-fixed-lib")
+              require_new_tests(fixed_full, names, 1)
+              fixed_failures = [(name, fixed_full["output"].get(name, "")) for name in fixed_full["failed_names"]]
+              comparisons = compare_failures(fixed_failures, baseline_reports, "strict fixed lib")
+              check(fixed_full["exit_code"] == (1 if fixed_failures else 0), "Full fixed lib command exit disagrees with test failures")
+          
+              canonical_exit = exit_code("canonical-http")
+              canonical_reports = []
+              canonical_failures = []
+              missing = []
+              canonical_lib_cases = []
+              for label in sources.get("canonical_expected_directories", []):
+                  path = REPORTS / f"http-transport-{label}.xml"
+                  if not path.exists():
+                      missing.append(label)
+                      continue
+                  cases = xml_report(path)
+                  failed = [(case.attrib.get("name", ""), "\n".join(node.text or "" for node in case if node.tag in ("failure", "error")))
+                            for case in cases if case.find("failure") is not None or case.find("error") is not None]
+                  canonical_failures.extend(failed)
+                  canonical_reports.append({"label": label, "testcases": len(cases), "failed_names": [name for name, _ in failed],
+                                            "skipped_names": [case.attrib.get("name", "") for case in cases if case.find("skipped") is not None]})
+                  if label == "lib":
+                      canonical_lib_cases = cases
+              check(bool(canonical_reports), "Canonical HTTP target produced no reports")
+              for name in names:
+                  observed = [case for case in canonical_lib_cases if case.attrib.get("name") == name]
+                  check(len(observed) == 1 and all(case.find("failure") is None and case.find("error") is None and case.find("skipped") is None for case in observed),
+                        f"Canonical lib must execute and pass {name} without skip")
+              for label in ("handlers", "integrations", "lib"):
+                  check(any(item["label"] == label for item in canonical_reports), f"Canonical {label} report is missing")
+              comparisons += compare_failures(canonical_failures, baseline_reports, "canonical HTTP")
+              check(canonical_exit in (0, 2), "Canonical target failed with an unexpected command/setup exit")
+              if missing:
+                  check(bool(canonical_failures), "Canonical coverage is missing without an observed package failure")
+              full_canonical = canonical_exit == 0 and not canonical_failures and not missing and not any(item["skipped_names"] for item in canonical_reports)
+              summary = {"tested_head": sources.get("tested_head"), "baseline_head": sources.get("baseline_head"),
+                         "reports": SUMMARIES, "canonical_command_exit": canonical_exit, "canonical_reports": canonical_reports,
+                         "canonical_missing_directories": missing, "canonical_failed_names": [name for name, _ in canonical_failures],
+                         "fresh_baseline_failure_comparisons": comparisons, "full_canonical_passed": full_canonical,
+                         "new_regression_names": names, "new_regressions_passed_without_skip": not ISSUES,
+                         "scoped_validation_passed": not ISSUES, "live_provider_requests": 0, "issues": ISSUES}
+              (REPORTS / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+              print(json.dumps(summary, indent=2))
+              if ISSUES:
+                  sys.exit(1)
+              if not full_canonical:
+                  print("::notice::Scoped offline checks passed. The full canonical HTTP target did not pass completely; remaining failures were reproduced on this run's exact parent. See missing directories and skipped cases in summary.json.")
+          
+          
+          if __name__ == "__main__":
+              main()
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: classifier-file-presence-offline-results
+          path: test-reports/
