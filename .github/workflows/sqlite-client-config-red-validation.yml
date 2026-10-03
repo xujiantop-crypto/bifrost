@@ -1,0 +1,83 @@
+name: SQLite client-config deterministic red validation
+on:
+  push:
+    branches: [test/sqlite-client-config-red-validation]
+permissions:
+  contents: read
+env:
+  BASELINE_HEAD: e8b579fd1a710753cfa97611b5cff6c3411b0825
+  GOTELEMETRY: 'off'
+jobs:
+  reproduce:
+    if: github.repository == 'xujiantop-crypto/bifrost'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: framework/go.mod
+          cache-dependency-path: |
+            core/go.sum
+            framework/go.sum
+            transports/go.sum
+            plugins/*/go.sum
+      - name: Verify untouched production and prepare workspace
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "$BASELINE_HEAD"
+          test "$(git rev-parse HEAD:framework/configstore/rdb.go)" = "$(git rev-parse "$BASELINE_HEAD:framework/configstore/rdb.go")"
+          go work init ./core ./framework ./transports
+          for d in plugins/*; do test ! -f "$d/go.mod" || go work use "./$d"; done
+          mkdir -p test-reports
+          python - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          def git(*args):
+              return subprocess.check_output(['git', *args], text=True).strip()
+          changed=git('diff','--name-only',os.environ['BASELINE_HEAD'],'HEAD').splitlines()
+          assert set(changed)=={'framework/configstore/rdb_test.go','.github/workflows/sqlite-client-config-red-validation.yml'},changed
+          env=json.loads(subprocess.check_output(['go','env','-json','CGO_ENABLED','GOOS','GOARCH'],text=True))
+          assert env['CGO_ENABLED']=='1',env
+          data={'tested_head':git('rev-parse','HEAD'),'baseline':os.environ['BASELINE_HEAD'],'changed_files':changed,
+                'production_rdb_blob':git('rev-parse','HEAD:framework/configstore/rdb.go'),'go_env':env,
+                'test_blob':git('rev-parse','HEAD:framework/configstore/rdb_test.go'),
+                'go_version':subprocess.check_output(['go','version'],text=True).strip()}
+          Path('test-reports/sources.json').write_text(json.dumps(data,indent=2)+'\n')
+          PY
+      - name: Execute actual Go method reproduction before any production edit
+        working-directory: framework
+        run: |
+          set +e
+          go test -json -count=1 -timeout 5m -run '^(TestClientConfigSQLiteConcurrentWrites|TestClientConfigSQLiteWriterControls)$' ./configstore > ../test-reports/red.jsonl 2>&1
+          printf '%s\n' "$?" > ../test-reports/red-exit.txt
+          go test -json -count=1 -timeout 5m -run '^(TestUpdateClientMetadata|TestUpdateClientMetadataRequiresClientConfig|TestUpdateClientConfigPreservesMetadata|TestUpdateClientConfig_PreservesMetadataAcrossSync)$' ./configstore > ../test-reports/existing-controls.jsonl 2>&1
+          printf '%s\n' "$?" > ../test-reports/existing-controls-exit.txt
+          exit 0
+      - name: Summarize without hiding failed assertions
+        if: always()
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          root=Path('test-reports')
+          summary={}
+          for name in ('red','existing-controls'):
+              rows=[]; raw=[]
+              for line in (root/(name+'.jsonl')).read_text().splitlines():
+                  try: rows.append(json.loads(line))
+                  except json.JSONDecodeError: raw.append(line)
+              terminal={r['Test']:r['Action'] for r in rows if r.get('Test') and r.get('Action') in ('pass','fail','skip')}
+              summary[name]={'exit':int((root/(name+'-exit.txt')).read_text()),'terminal':terminal,'raw_lines':raw}
+          (root/'summary.json').write_text(json.dumps(summary,indent=2)+'\n')
+          print(json.dumps(summary,indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sqlite-client-config-red-results
+          path: test-reports
+          retention-days: 14
+          if-no-files-found: error
