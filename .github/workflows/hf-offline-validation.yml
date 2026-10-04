@@ -1,0 +1,463 @@
+name: Hugging Face alias metadata offline validation
+on:
+  push:
+    branches: [test/huggingface-alias-metadata]
+permissions:
+  contents: read
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: bash
+    env:
+      SOURCE_SHA: '0b233e3c6fda590f4b8b8044618d891de52e3cee'
+      SOURCE_PARENT_SHA: 'df75d1e2d7eec7a95f20a3a94c75a830b1a197ad'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: xujiantop-crypto/bifrost
+          ref: '0b233e3c6fda590f4b8b8044618d891de52e3cee'
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Verify exact source checkout
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(git rev-parse HEAD^)" = "$SOURCE_PARENT_SHA"
+          test -z "$(git status --porcelain)"
+          mkdir -p "$RUNNER_TEMP/hf-validation"
+          {
+            printf 'source_sha=%s\n' "$SOURCE_SHA"
+            printf 'source_tree=%s\n' "$(git rev-parse HEAD^{tree})"
+            printf 'workflow_sha=%s\n' "$GITHUB_SHA"
+            printf 'workflow_ref=%s\n' "$GITHUB_WORKFLOW_REF"
+            git show -s --format='author=%an <%ae>%ncommitter=%cn <%ce>%nparents=%P' HEAD
+            git ls-tree HEAD core/providers/huggingface/ tests/e2e/api/collections/provider-harness.json Makefile
+          } | tee "$RUNNER_TEMP/hf-validation/source-binding.txt"
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: core/go.mod
+          cache-dependency-path: core/go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Exact frozen HTTP regression against its unchanged parent
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/hf-validation/prepare-parent-red.go" <<'HF_PARENT_PREPARE'
+          // Fork-workflow helper: reads frozen Git objects and prepares only a temporary
+          // parent package overlay. It does not modify the checked-out source tree.
+          package main
+          
+          import (
+          	"bytes"
+          	"crypto/sha256"
+          	"encoding/hex"
+          	"encoding/json"
+          	"flag"
+          	"fmt"
+          	"go/ast"
+          	"go/parser"
+          	"go/token"
+          	"os"
+          	"os/exec"
+          	"path/filepath"
+          	"reflect"
+          	"sort"
+          	"strings"
+          )
+          
+          const caseName = "TestListModelsByKeyEnrichesUnownedAliasMetadataAcrossProviders"
+          const packagePrefix = "core/providers/huggingface/"
+          const testPath = packagePrefix + "models_test.go"
+          
+          func must(err error) {
+          	if err != nil {
+          		panic(err)
+          	}
+          }
+          
+          func git(args ...string) []byte {
+          	result, err := exec.Command("git", args...).CombinedOutput()
+          	if err != nil {
+          		panic(fmt.Sprintf("git %v: %v: %s", args, err, result))
+          	}
+          	return result
+          }
+          
+          func sha(data []byte) string {
+          	value := sha256.Sum256(data)
+          	return hex.EncodeToString(value[:])
+          }
+          
+          func paths(ref string) []string {
+          	var result []string
+          	for _, path := range strings.Split(strings.TrimSpace(string(git("ls-tree", "-r", "--name-only", ref, packagePrefix))), "\n") {
+          		if strings.HasSuffix(path, ".go") {
+          			result = append(result, path)
+          		}
+          	}
+          	sort.Strings(result)
+          	return result
+          }
+          
+          func importPaths(file *ast.File) []string {
+          	var result []string
+          	for _, imported := range file.Imports {
+          		name := ""
+          		if imported.Name != nil {
+          			name = imported.Name.Name
+          		}
+          		result = append(result, name+" "+imported.Path.Value)
+          	}
+          	sort.Strings(result)
+          	return result
+          }
+          
+          func metadataLines(fset *token.FileSet, file *ast.File) map[string][]int {
+          	result := map[string][]int{"HuggingFaceID": {}, "SupportedMethods": {}}
+          	for _, declaration := range file.Decls {
+          		function, ok := declaration.(*ast.FuncDecl)
+          		if !ok || function.Name.Name != caseName {
+          			continue
+          		}
+          		ast.Inspect(function.Body, func(node ast.Node) bool {
+          			call, ok := node.(*ast.CallExpr)
+          			if !ok {
+          				return true
+          			}
+          			callee, ok := call.Fun.(*ast.SelectorExpr)
+          			if !ok {
+          				return true
+          			}
+          			owner, ok := callee.X.(*ast.Ident)
+          			if !ok || owner.Name != "assert" {
+          				return true
+          			}
+          			for _, argument := range call.Args {
+          				field, ok := argument.(*ast.SelectorExpr)
+          				if !ok {
+          					continue
+          				}
+          				if _, metadata := result[field.Sel.Name]; metadata {
+          					result[field.Sel.Name] = append(result[field.Sel.Name], fset.Position(call.Pos()).Line)
+          				}
+          			}
+          			return true
+          		})
+          	}
+          	if len(result["HuggingFaceID"]) != 2 || len(result["SupportedMethods"]) != 2 {
+          		panic("frozen HTTP test's expected metadata assertion structure changed")
+          	}
+          	return result
+          }
+          
+          func main() {
+          	source := flag.String("source-sha", "", "frozen source commit")
+          	parent := flag.String("parent-sha", "", "frozen source commit's parent")
+          	out := flag.String("out", "", "temporary evidence directory")
+          	inspect := flag.String("inspect-test-file", "", "only derive metadata assertion lines from an existing parent overlay file; no tests run")
+          	flag.Parse()
+          	if *inspect != "" {
+          		data, err := os.ReadFile(*inspect)
+          		must(err)
+          		fset := token.NewFileSet()
+          		parsed, err := parser.ParseFile(fset, *inspect, data, 0)
+          		must(err)
+          		encoded, err := json.MarshalIndent(map[string]any{
+          			"test_name": caseName, "metadata_assertion_lines": metadataLines(fset, parsed),
+          			"inspected_test_file_sha256": sha(data), "scope": "existing Windows parent log classifier check only; no source tests run",
+          		}, "", "  ")
+          		must(err)
+          		fmt.Println(string(encoded))
+          		return
+          	}
+          	if len(*source) != 40 || len(*parent) != 40 || *out == "" {
+          		panic("source-sha, parent-sha and out are required")
+          	}
+          	if strings.TrimSpace(string(git("rev-parse", "HEAD"))) != *source || strings.TrimSpace(string(git("rev-parse", "HEAD^"))) != *parent {
+          		panic("source/parent binding mismatch")
+          	}
+          	for _, path := range strings.Split(strings.TrimSpace(string(git("diff", "--name-only", *parent, *source))), "\n") {
+          		if !strings.HasPrefix(path, packagePrefix) && path != "core/changelog.md" && path != "tests/e2e/api/collections/provider-harness.json" {
+          			panic("unexpected source change affects exact-parent overlay: " + path)
+          		}
+          	}
+          	if !reflect.DeepEqual(paths(*source), paths(*parent)) {
+          		panic("parent and source HF package file sets differ")
+          	}
+          	finalTests := git("show", *source+":"+testPath)
+          	parentTests := git("show", *parent+":"+testPath)
+          	fset := token.NewFileSet()
+          	parsed, err := parser.ParseFile(fset, testPath, finalTests, 0)
+          	must(err)
+          	parentParsed, err := parser.ParseFile(token.NewFileSet(), testPath, parentTests, 0)
+          	must(err)
+          	if !reflect.DeepEqual(importPaths(parsed), importPaths(parentParsed)) {
+          		panic("parent lacks frozen test imports; explicit review required")
+          	}
+          	var testBytes []byte
+          	for _, declaration := range parsed.Decls {
+          		if function, ok := declaration.(*ast.FuncDecl); ok && function.Name.Name == caseName {
+          			if testBytes != nil {
+          				panic("duplicate frozen regression")
+          			}
+          			testBytes = finalTests[fset.Position(function.Pos()).Offset:fset.Position(function.End()).Offset]
+          		}
+          	}
+          	if len(testBytes) == 0 || bytes.Contains(parentTests, []byte("func "+caseName+"(")) {
+          		panic("regression absent from frozen source or already present in parent")
+          	}
+          	must(os.MkdirAll(filepath.Join(*out, "parent-package"), 0755))
+          	overlay := make(map[string]string)
+          	baselineHashes := make(map[string]string)
+          	var assertionLines map[string][]int
+          	for _, path := range paths(*parent) {
+          		baseline := git("show", *parent+":"+path)
+          		baselineHashes[path] = sha(baseline)
+          		content := baseline
+          		if path == testPath {
+          			content = append(append(append([]byte{}, baseline...), []byte("\n\n")...), testBytes...)
+          			content = append(content, '\n')
+          			parentFset := token.NewFileSet()
+          			parentWithRegression, err := parser.ParseFile(parentFset, path, content, 0)
+          			must(err)
+          			assertionLines = metadataLines(parentFset, parentWithRegression)
+          		}
+          		temporary := filepath.Join(*out, "parent-package", filepath.Base(path))
+          		must(os.WriteFile(temporary, content, 0644))
+          		original, err := filepath.Abs(path)
+          		must(err)
+          		overlay[original] = temporary
+          	}
+          	encoded, err := json.MarshalIndent(map[string]any{"Replace": overlay}, "", "  ")
+          	must(err)
+          	must(os.WriteFile(filepath.Join(*out, "parent-red-overlay.json"), append(encoded, '\n'), 0644))
+          	must(os.WriteFile(filepath.Join(*out, "frozen-http-regression.go.txt"), testBytes, 0644))
+          	manifest := map[string]any{
+          		"source_sha": *source, "source_tree": strings.TrimSpace(string(git("rev-parse", *source+"^{tree}"))),
+          		"parent_sha": *parent, "parent_tree": strings.TrimSpace(string(git("rev-parse", *parent+"^{tree}"))),
+          		"test_name": caseName, "exact_frozen_function_sha256": sha(testBytes),
+          		"frozen_models_test_sha256": sha(finalTests), "parent_models_test_sha256": sha(parentTests),
+          		"metadata_assertion_lines":       assertionLines,
+          		"parent_package_baseline_sha256": baselineHashes,
+          		"source_production_modified":     false, "global_observer_hook_added": false,
+          		"overlay_scope": "all exact-parent Hugging Face package .go files; only frozen HTTP regression appended to temporary parent models_test.go",
+          	}
+          	encoded, err = json.MarshalIndent(manifest, "", "  ")
+          	must(err)
+          	must(os.WriteFile(filepath.Join(*out, "parent-red-binding.json"), append(encoded, '\n'), 0644))
+          	fmt.Println(string(encoded))
+          }
+          HF_PARENT_PREPARE
+          cat > "$RUNNER_TEMP/hf-validation/check-parent-red.py" <<'HF_PARENT_CHECK'
+          """Require a real assertion red from the same frozen HTTP regression."""
+          import json
+          from pathlib import Path
+          import re
+          import sys
+          
+          log = Path(sys.argv[1])
+          returncode = int(sys.argv[2])
+          binding = json.loads(Path(sys.argv[3]).read_text(encoding='utf-8'))
+          raw = '--raw-existing-windows-log' in sys.argv[4:]
+          logtext = log.read_text(encoding='utf-8')
+          events = [] if raw else [json.loads(line) for line in logtext.splitlines() if line.strip()]
+          name = 'TestListModelsByKeyEnrichesUnownedAliasMetadataAcrossProviders'
+          assert binding['test_name'] == name
+          output = logtext if raw else ''.join(event.get('Output', '') for event in events)
+          assert returncode == 1, f'expected assertion exit 1, got {returncode}'
+          if raw:
+              assert len(re.findall(r'^=== RUN\s+' + name + r'\s*$', output, re.MULTILINE)) == 1
+              assert len(re.findall(r'^--- FAIL:\s+' + name + r'\s+\(', output, re.MULTILINE)) == 1
+          else:
+              assert sum(event.get('Action') == 'run' and event.get('Test') == name for event in events) == 1, 'exact frozen case did not run once'
+              assert sum(event.get('Action') == 'fail' and event.get('Test') == name for event in events) == 1, 'exact frozen case did not fail once'
+          assert not any(event.get('Action') == 'build-fail' for event in events), 'compile failure is not a regression red'
+          assert 'Error Trace:' in output and ('Not equal:' in output or 'elements differ' in output), 'not an assertion red'
+          traces = re.findall(r'Error Trace:\s*(.*?)(?=\s*Error:)', output, re.DOTALL)
+          assert traces, 'missing assertion trace blocks'
+          lines = []
+          for trace in traces:
+              frames = re.findall(r'([^\s]+\.go):(\d+)', trace)
+              assert frames, 'assertion trace has no source frames'
+              for filename, line in frames:
+                  assert filename.replace('\\', '/').endswith('/models_test.go') or filename == 'models_test.go', f'unrelated assertion source: {filename}'
+                  lines.append(int(line))
+          id_lines = set(binding['metadata_assertion_lines']['HuggingFaceID'])
+          method_lines = set(binding['metadata_assertion_lines']['SupportedMethods'])
+          assert lines and set(lines) <= id_lines | method_lines, f'unrelated assertion lines: {lines}'
+          assert set(lines) & id_lines and set(lines) & method_lines, 'both HF ID and methods must produce assertion red evidence'
+          for rejected in ('panic:', '[build failed]', 'undefined:', 'unexpected alias target', 'each configured alias keeps its single-pass ownership'):
+              assert rejected not in output, f'unrelated setup or ownership failure: {rejected}'
+          result = {
+              'status': 'EXPECTED_EXACT_PARENT_ASSERTION_RED',
+              'test_name': name,
+              'go_test_exit_code': returncode,
+              'metadata_assertion_evidence': True,
+              'observed_metadata_assertion_lines': lines,
+              'allowed_metadata_assertion_lines': binding['metadata_assertion_lines'],
+              'compile_or_setup_failure_accepted': False,
+              'global_observer_hook_used': False,
+              'scope': 'classifier check of existing Windows evidence; no source rerun and no Linux claim' if raw else 'workflow JSON parent-red evidence',
+          }
+          destination = Path(sys.argv[3]).with_name('parent-red-classifier-existing-log.json') if raw else log.with_name('parent-red-result.json')
+          destination.write_text(json.dumps(result, indent=2) + '\n', encoding='utf-8')
+          print(json.dumps(result, indent=2))
+          HF_PARENT_CHECK
+          go run "$RUNNER_TEMP/hf-validation/prepare-parent-red.go" --source-sha "$SOURCE_SHA" --parent-sha "$SOURCE_PARENT_SHA" --out "$RUNNER_TEMP/hf-validation" > "$RUNNER_TEMP/hf-validation/parent-red-prepare.log"
+          set +e
+          (cd core && go test -overlay "$RUNNER_TEMP/hf-validation/parent-red-overlay.json" ./providers/huggingface -run '^TestListModelsByKeyEnrichesUnownedAliasMetadataAcrossProviders$' -count=1 -v -json) > "$RUNNER_TEMP/hf-validation/parent-red.log"
+          parent_status=$?
+          set -e
+          cat "$RUNNER_TEMP/hf-validation/parent-red.log"
+          python3 "$RUNNER_TEMP/hf-validation/check-parent-red.py" "$RUNNER_TEMP/hf-validation/parent-red.log" "$parent_status" "$RUNNER_TEMP/hf-validation/parent-red-binding.json"
+          test -z "$(git diff --name-only)"
+      - name: Canonical scoped ListModels and HuggingFace helper tests
+        run: |
+          set -euo pipefail
+          go version | tee "$RUNNER_TEMP/hf-validation/go-version.txt"
+          make test-core PROVIDER=huggingface PATTERN=TestListModelsByKey 2>&1 | tee "$RUNNER_TEMP/hf-validation/canonical-make.log"
+          test -s test-reports/core-huggingface-TestListModelsByKey.xml
+          cp test-reports/core-huggingface-TestListModelsByKey.xml "$RUNNER_TEMP/hf-validation/huggingface-units.xml"
+          make test-core PROVIDER=huggingface PATTERN=TestHuggingFace 2>&1 | tee "$RUNNER_TEMP/hf-validation/canonical-huggingface-helper-make.log"
+          test -s test-reports/core-huggingface-TestHuggingFace.xml
+          cp test-reports/core-huggingface-TestHuggingFace.xml "$RUNNER_TEMP/hf-validation/huggingface-helper-units.xml"
+      - name: All offline Hugging Face tests with race detector
+        working-directory: core
+        run: |
+          set -euo pipefail
+          go test ./providers/huggingface -skip '^TestHuggingface$' -race -count=1 -v 2>&1 | tee "$RUNNER_TEMP/hf-validation/offline-race.log"
+      - name: Vet and formatting
+        working-directory: core
+        run: |
+          set -euo pipefail
+          go vet ./providers/huggingface 2>&1 | tee "$RUNNER_TEMP/hf-validation/vet.log"
+          gofmt -l providers/huggingface/*.go | tee "$RUNNER_TEMP/hf-validation/gofmt.log"
+          test ! -s "$RUNNER_TEMP/hf-validation/gofmt.log"
+      - name: Provider harness executable item tree and scripts
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/hf-validation/harness-features.json" <<'HF_EXPECTATIONS'
+          [
+            {
+              "keyword": "DeepInfra model discovery",
+              "caseNames": [
+                "huggingface/deepinfra models - DeepInfra model discovery - #7761"
+              ]
+            },
+            {
+              "keyword": "legacy provider model backfill",
+              "caseNames": [
+                "huggingface/nebius/harness/legacy-model configured allowlist - legacy provider model backfill - #7761",
+                "huggingface/nebius/harness/legacy-model qualified aliases to discovered DeepInfra model - legacy provider model backfill - #7761"
+              ],
+              "requiredScriptSnippets": {
+                "huggingface/nebius/harness/legacy-model qualified aliases to discovered DeepInfra model - legacy provider model backfill - #7761": [
+                  "hfConfiguredAliasHuggingFaceID",
+                  "hfConfiguredAliasSupportedMethods",
+                  "alias lost target Hub ID",
+                  "alias lost target supported methods"
+                ]
+              }
+            },
+            {
+              "keyword": "provider named Hub organizations",
+              "caseNames": [
+                "huggingface/deepinfra/harness-model bare allowlist - provider named Hub organizations - #7761"
+              ]
+            }
+          ]
+          HF_EXPECTATIONS
+          cat > "$RUNNER_TEMP/hf-validation/check-harness.mjs" <<'HF_CHECKER'
+          import assert from 'node:assert/strict';
+          import { readFileSync, writeFileSync } from 'node:fs';
+          import { spawnSync } from 'node:child_process';
+          import { Script } from 'node:vm';
+          
+          const [expectationsPath, source, outputDir] = process.argv.slice(2);
+          assert.ok(expectationsPath && source && outputDir, 'usage: checker expectations.json source.json outputDir');
+          const expectations = JSON.parse(readFileSync(expectationsPath, 'utf8'));
+          assert.ok(Array.isArray(expectations) && expectations.length >= 3, 'include the three historical features; metadata extends the alias case');
+          
+          // Walk only Postman's executable item tree. A request-shaped value in event data
+          // or another JSON property is not a reachable collection request.
+          function inventory(collection) {
+            const requests = [];
+            let scripts = 0;
+            function visit(node, ancestors = []) {
+              const path = [...ancestors, node.name || '<collection>'];
+              for (const event of node.event || []) {
+                if (event.script?.exec == null) continue;
+                const source = Array.isArray(event.script.exec) ? event.script.exec.join('\n') : event.script.exec;
+                assert.equal(typeof source, 'string', `invalid event script at ${path.join(' > ')}`);
+                new Script(`(function(pm) {\n${source}\n})`, { filename: path.join(' > ') });
+                scripts++;
+              }
+              if (node.request) requests.push({ name: node.name, path, scriptSources: (node.event || []).map(event => Array.isArray(event.script?.exec) ? event.script.exec.join('\n') : event.script?.exec || '').join('\n') });
+              for (const child of node.item || []) visit(child, path);
+            }
+            visit(collection);
+            return { requests, scripts };
+          }
+          
+          function run(script, args) {
+            const result = spawnSync(process.execPath, [script, ...args], { encoding: 'utf8' });
+            process.stdout.write(result.stdout || '');
+            process.stderr.write(result.stderr || '');
+            assert.equal(result.status, 0, `${script} failed`);
+          }
+          
+          const rawInventory = inventory(JSON.parse(readFileSync(source, 'utf8')));
+          const augmented = `${outputDir}/hf-augmented.json`;
+          run('tests/e2e/api/runners/augment-provider-harness.mjs', ['--source', source, '--out', augmented]);
+          const augmentedInventory = inventory(JSON.parse(readFileSync(augmented, 'utf8')));
+          const features = [];
+          for (const [index, expected] of expectations.entries()) {
+            assert.equal(typeof expected.keyword, 'string');
+            assert.ok(expected.keyword.trim() && !expected.keyword.includes('__'), 'feature keyword must be frozen');
+            assert.ok(Array.isArray(expected.caseNames) && expected.caseNames.length > 0, 'explicit executable case names are required');
+            assert.equal(new Set(expected.caseNames).size, expected.caseNames.length, 'duplicate expected case names');
+            const filteredPath = `${outputDir}/hf-feature-${index}.json`;
+            run('tests/e2e/api/runners/filter-collection.mjs', ['--source', augmented, '--out', filteredPath, '--provider', 'huggingface', '--feature', expected.keyword]);
+            const filtered = inventory(JSON.parse(readFileSync(filteredPath, 'utf8')));
+            for (const name of expected.caseNames) {
+              assert.equal(rawInventory.requests.filter(item => item.name === name).length, 1, `raw executable case missing/duplicated: ${name}`);
+              assert.equal(filtered.requests.filter(item => item.name === name).length, 1, `filtered executable case missing/duplicated: ${name}`);
+              for (const snippet of expected.requiredScriptSnippets?.[name] || []) {
+                assert.ok(rawInventory.requests.find(item => item.name === name).scriptSources.includes(snippet), `raw metadata assertion missing: ${snippet}`);
+                assert.ok(filtered.requests.find(item => item.name === name).scriptSources.includes(snippet), `filtered metadata assertion missing: ${snippet}`);
+              }
+            }
+            features.push({ keyword: expected.keyword, requiredCases: expected.caseNames, requiredScriptSnippets: expected.requiredScriptSnippets || {}, reachableFilteredRequests: filtered.requests.length, compiledFilteredScripts: filtered.scripts });
+          }
+          const report = {
+            rawReachableRequests: rawInventory.requests.length,
+            rawExecutableScripts: rawInventory.scripts,
+            augmentedReachableRequests: augmentedInventory.requests.length,
+            augmentedExecutableScripts: augmentedInventory.scripts,
+            features,
+            networkRequests: 0,
+            scope: 'Postman item-tree reachability, augmentation/filtering and event-script compilation only; no Newman or live provider requests',
+          };
+          writeFileSync(`${outputDir}/harness-structure.json`, `${JSON.stringify(report, null, 2)}\n`);
+          console.log(JSON.stringify(report, null, 2));
+          HF_CHECKER
+          node "$RUNNER_TEMP/hf-validation/check-harness.mjs" "$RUNNER_TEMP/hf-validation/harness-features.json" tests/e2e/api/collections/provider-harness.json "$RUNNER_TEMP/hf-validation" 2>&1 | tee "$RUNNER_TEMP/hf-validation/harness-structure.log"
+      - name: Preserve scoped JUnit on failure
+        if: always()
+        run: |
+          if [ -f test-reports/core-huggingface-TestListModelsByKey.xml ]; then
+            cp test-reports/core-huggingface-TestListModelsByKey.xml "$RUNNER_TEMP/hf-validation/huggingface-units.xml"
+          fi
+          if [ -f test-reports/core-huggingface-TestHuggingFace.xml ]; then
+            cp test-reports/core-huggingface-TestHuggingFace.xml "$RUNNER_TEMP/hf-validation/huggingface-helper-units.xml"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: huggingface-alias-metadata-offline-results
+          path: ${{ runner.temp }}/hf-validation/
+          if-no-files-found: error
