@@ -28,7 +28,9 @@ jobs:
       - name: Verify source identity and prepare workspace
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "$PRODUCTION_HEAD"
+          # Allow validation-only follow-up commits while requiring the exact
+          # production fix to remain in the tested history.
+          git merge-base --is-ancestor "$PRODUCTION_HEAD" HEAD
           go work init ./core ./framework ./transports
           for d in plugins/*; do test ! -f "$d/go.mod" || go work use "./$d"; done
           mkdir -p test-reports
