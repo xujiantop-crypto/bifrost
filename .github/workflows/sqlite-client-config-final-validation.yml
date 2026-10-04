@@ -1,0 +1,100 @@
+name: SQLite client-config final validation
+on:
+  push:
+    branches: [test/sqlite-client-config-final-validation]
+permissions:
+  contents: read
+env:
+  BASELINE_HEAD: e8b579fd1a710753cfa97611b5cff6c3411b0825
+  PRODUCTION_HEAD: 73247c6fbbce9b681a3e4afadd73d836b15ec54a
+  GOTELEMETRY: 'off'
+jobs:
+  validate:
+    if: github.repository == 'xujiantop-crypto/bifrost'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: framework/go.mod
+          cache-dependency-path: |
+            core/go.sum
+            framework/go.sum
+            transports/go.sum
+            plugins/*/go.sum
+      - name: Verify source identity and prepare workspace
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "$PRODUCTION_HEAD"
+          go work init ./core ./framework ./transports
+          for d in plugins/*; do test ! -f "$d/go.mod" || go work use "./$d"; done
+          mkdir -p test-reports
+          python - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          def git(*args): return subprocess.check_output(['git',*args],text=True).strip()
+          changed=git('diff','--name-only',os.environ['BASELINE_HEAD'],'HEAD').splitlines()
+          assert 'framework/configstore/rdb.go' in changed
+          assert 'framework/configstore/rdb_test.go' in changed
+          assert 'framework/changelog.md' in changed
+          assert git('rev-parse','HEAD:framework/configstore/rdb.go') != git('rev-parse',os.environ['BASELINE_HEAD']+':framework/configstore/rdb.go')
+          Path('test-reports/sources.json').write_text(json.dumps({'head':git('rev-parse','HEAD'),'parent':os.environ['BASELINE_HEAD'],'changed':changed,'rdb':git('rev-parse','HEAD:framework/configstore/rdb.go'),'test':git('rev-parse','HEAD:framework/configstore/rdb_test.go'),'go':subprocess.check_output(['go','version'],text=True).strip()},indent=2)+'\n')
+          PY
+      - name: Fixed tests and existing controls
+        working-directory: framework
+        run: |
+          set -euo pipefail
+          go test -json -count=1 -timeout 8m -run '^(TestClientConfigSQLiteConcurrentWrites|TestClientConfigSQLiteWriterControls)$' ./configstore > ../test-reports/fixed.jsonl
+          go test -json -count=1 -timeout 8m -run '^(TestUpdateClientMetadata|TestUpdateClientMetadataRequiresClientConfig|TestUpdateClientConfigPreservesMetadata|TestUpdateClientConfig_PreservesMetadataAcrossSync)$' ./configstore > ../test-reports/existing-fixed.jsonl
+      - name: Exact-parent red reproduction with final portable tests
+        run: |
+          set -u
+          git show "$BASELINE_HEAD:framework/configstore/rdb.go" > /tmp/rdb-baseline.go
+          python - <<'PY'
+          import json,os
+          from pathlib import Path
+          p=Path('/tmp/rdb-overlay.json').resolve()
+          source=Path('framework/configstore/rdb.go').resolve()
+          p.write_text(json.dumps({'Replace':{str(source):'/tmp/rdb-baseline.go'}})+'\n')
+          PY
+          set +e
+          (cd framework && go test -json -count=1 -timeout 8m -overlay=/tmp/rdb-overlay.json -run '^(TestClientConfigSQLiteConcurrentWrites|TestClientConfigSQLiteWriterControls)$' ./configstore) > test-reports/parent-red.jsonl 2>&1
+          printf '%s\n' "$?" > test-reports/parent-red-exit.txt
+          set -e
+      - name: Race and vet on fixed target
+        working-directory: framework
+        run: |
+          go test -race -count=1 -timeout 8m -run '^(TestClientConfigSQLiteConcurrentWrites|TestClientConfigSQLiteWriterControls)$' ./configstore
+          go vet ./configstore
+      - name: Parse fixed and parent outcomes
+        if: always()
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          root=Path('test-reports')
+          def parse(name):
+              rows=[json.loads(x) for x in (root/name).read_text().splitlines() if x.startswith('{')]
+              return {'terminal':{r['Test']:r['Action'] for r in rows if r.get('Test') and r.get('Action') in ('pass','fail','skip')},'skips':sum(1 for r in rows if r.get('Action')=='skip')}
+          fixed=parse('fixed.jsonl'); existing=parse('existing-fixed.jsonl'); parent=parse('parent-red.jsonl')
+          expected=['TestClientConfigSQLiteConcurrentWrites/config','TestClientConfigSQLiteConcurrentWrites/metadata','TestClientConfigSQLiteWriterControls/failed_patch_rollback','TestClientConfigSQLiteWriterControls/fresh_config','TestClientConfigSQLiteWriterControls/missing_metadata_row','TestClientConfigSQLiteWriterControls/nested_merge']
+          assert fixed['skips']==0 and all(fixed['terminal'].get(k)=='pass' for k in expected),fixed
+          assert existing['skips']==0 and all(v=='pass' for v in existing['terminal'].values()),existing
+          assert parent['skips']==0 and parent['terminal'].get('TestClientConfigSQLiteConcurrentWrites/config')=='fail' and parent['terminal'].get('TestClientConfigSQLiteConcurrentWrites/metadata')=='fail',parent
+          assert all(parent['terminal'].get(k)=='pass' for k in expected[2:]),parent
+          text=(root/'parent-red.jsonl').read_text()
+          assert 'extended=517' in text and 'database is locked' in text,text
+          result={'fixed':fixed,'existing':existing,'parent_red':parent,'parent_red_exit':int((root/'parent-red-exit.txt').read_text()),'asserted':'fixed six pass; parent two fail/four pass; no skips; SQLITE_BUSY_SNAPSHOT 517'}
+          (root/'summary.json').write_text(json.dumps(result,indent=2)+'\n')
+          print(json.dumps(result,indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sqlite-client-config-final-validation
+          path: test-reports
+          retention-days: 14
+
