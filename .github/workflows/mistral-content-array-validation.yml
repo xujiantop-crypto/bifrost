@@ -1,0 +1,179 @@
+name: Mistral content array offline validation
+
+on:
+  push:
+    branches: [test/mistral-content-array-validation]
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_FIXED: aa345abf4ec8b910756ed1b80da4478cc46c5665
+  GOWORK: 'off'
+  GOTOOLCHAIN: local
+  GOTELEMETRY: 'off'
+  USE_INFISICAL: '0'
+  MISTRAL_API_KEY: ''
+  OPENAI_API_KEY: ''
+
+jobs:
+  linux:
+    if: github.repository == 'xujiantop-crypto/bifrost'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_FIXED }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.0'
+          cache-dependency-path: core/go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Bind source and install reporting tool
+        run: |
+          set -euo pipefail
+          mkdir -p validation
+          test "$(git rev-parse HEAD)" = "$SOURCE_FIXED"
+          test "$(git rev-parse "${SOURCE_FIXED}^")" = "e8b579fd1a710753cfa97611b5cff6c3411b0825"
+          test ! -f .env
+          git show --no-patch --format=fuller HEAD > validation/source.txt
+          git rev-parse "${SOURCE_FIXED}^" > validation/parent.txt
+          git rev-parse "${SOURCE_FIXED}:core/providers/mistral/mistral.go" > validation/fixed-production-blob.txt
+          git rev-parse "${SOURCE_FIXED}^:core/providers/mistral/mistral.go" > validation/parent-production-blob.txt
+          sha256sum core/providers/mistral/mistral_test.go > validation/test-source.sha256
+          go version > validation/go-version.txt
+          go install gotest.tools/gotestsum@v1.13.0
+          gotestsum --version > validation/gotestsum-version.txt
+      - name: Public stream regressions three times with race and vet
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          set +e
+          (cd core && go test -json -race -vet=all -count=3 -timeout=3m -run '^TestMistralContentArray$' ./providers/mistral) > validation/fixed-targeted.jsonl 2> validation/fixed-targeted.stderr
+          result=$?
+          printf '%s\n' "$result" > validation/fixed-targeted.exit
+          exit "$result"
+      - name: All offline Mistral tests with race and vet
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          set +e
+          # Exact live entrypoint and credential-driven integration functions are excluded.
+          (cd core && go test -json -race -vet=all -count=1 -timeout=5m -skip '^TestMistral$|Integration$' ./providers/mistral) > validation/fixed-offline-mistral.jsonl 2> validation/fixed-offline-mistral.stderr
+          result=$?
+          printf '%s\n' "$result" > validation/fixed-offline-mistral.exit
+          exit "$result"
+      - name: Shared stream raw and fallback regressions
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          set +e
+          (cd core && go test -json -race -vet=all -count=1 -timeout=3m -run '^(TestChatStreamRawResponseKeeps.*|TestResponsesFallbackRawResponseKeepsEveryFrameExactlyOnce)$' ./providers/openai) > validation/shared-stream.jsonl 2> validation/shared-stream.stderr
+          result=$?
+          printf '%s\n' "$result" > validation/shared-stream.exit
+          exit "$result"
+      - name: Exact parent source must reproduce final policy failures
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          cp core/providers/mistral/mistral.go "$RUNNER_TEMP/fixed-mistral.go"
+          trap 'cp "$RUNNER_TEMP/fixed-mistral.go" core/providers/mistral/mistral.go' EXIT
+          git show "${SOURCE_FIXED}^:core/providers/mistral/mistral.go" > core/providers/mistral/mistral.go
+          test "$(git hash-object core/providers/mistral/mistral.go)" = "$(cat validation/parent-production-blob.txt)"
+          set +e
+          (cd core && go test -json -count=1 -timeout=3m -run '^TestMistralContentArray$' ./providers/mistral) > validation/parent-red.jsonl 2> validation/parent-red.stderr
+          result=$?
+          set -e
+          printf '%s\n' "$result" > validation/parent-red.exit
+          cp "$RUNNER_TEMP/fixed-mistral.go" core/providers/mistral/mistral.go
+          trap - EXIT
+          git diff --exit-code -- core/providers/mistral/mistral.go
+          test "$result" = 1
+      - name: Canonical scoped provider make target
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          set +e
+          make test-core PROVIDER=mistral PATTERN=MistralContentArray TEST_REPORTS_DIR=validation/canonical > validation/canonical.log 2>&1
+          result=$?
+          printf '%s\n' "$result" > validation/canonical.exit
+          exit "$result"
+      - name: Compare allocation review gates with exact parent baseline
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          git worktree add --detach "$RUNNER_TEMP/mistral-parent-gate" "${SOURCE_FIXED}^"
+          git -C "$RUNNER_TEMP/mistral-parent-gate" rev-parse HEAD > validation/gate-parent-head.txt
+          set +e
+          (cd core && go test -json -count=1 -timeout=3m -run '^(TestEveryLoopBoundJSONMutationIsReviewed|TestCoveredSitesHaveARealTest)$' ./internal/memtest) > validation/fixed-gate.jsonl 2> validation/fixed-gate.stderr
+          printf '%s\n' "$?" > validation/fixed-gate.exit
+          (cd "$RUNNER_TEMP/mistral-parent-gate/core" && go test -json -count=1 -timeout=3m -run '^(TestEveryLoopBoundJSONMutationIsReviewed|TestCoveredSitesHaveARealTest)$' ./internal/memtest) > validation/parent-gate.jsonl 2> validation/parent-gate.stderr
+          printf '%s\n' "$?" > validation/parent-gate.exit
+          exit 0
+      - name: Bind restored source and collect summaries
+        if: always()
+        run: |
+          set -euo pipefail
+          test "$(git hash-object core/providers/mistral/mistral.go)" = "$(cat validation/fixed-production-blob.txt)"
+          python3 - <<'PY'
+          import collections, json, pathlib, xml.etree.ElementTree as ET
+          root = pathlib.Path('validation')
+          receipts = {}
+          problems = []
+          for label in ('fixed-targeted', 'fixed-offline-mistral', 'shared-stream', 'parent-red', 'fixed-gate', 'parent-gate'):
+              events = [json.loads(line) for line in (root / (label + '.jsonl')).read_text().splitlines() if line.startswith('{')]
+              names = {e['Test'] for e in events if 'Test' in e}
+              leaves = {n for n in names if not any(o.startswith(n + '/') for o in names)}
+              outcomes = collections.Counter((e['Test'], e['Action']) for e in events if e.get('Test') in leaves and e['Action'] in ('pass', 'fail', 'skip'))
+              summary = {name: {a: outcomes[(name, a)] for a in ('pass', 'fail', 'skip')} for name in sorted(leaves)}
+              receipts[label] = {'exit': int((root / (label + '.exit')).read_text()), 'leaves': summary}
+              if not leaves or any(v['skip'] for v in summary.values()):
+                  problems.append(label + ': empty discovery or unexpected skip')
+              if label not in ('parent-red', 'fixed-gate', 'parent-gate') and (receipts[label]['exit'] != 0 or any(v['fail'] for v in summary.values())):
+                  problems.append(label + ': failed')
+          fixed = receipts['fixed-targeted']['leaves']
+          red = receipts['parent-red']['leaves']
+          expected_fail = set(['TestMistralContentArray/ChatCompletionStream/EmptyArrayControl', 'TestMistralContentArray/ChatCompletionStream/InvalidSecondChoice', 'TestMistralContentArray/ChatCompletionStream/MalformedJSON', 'TestMistralContentArray/ChatCompletionStream/MalformedTextBlock', 'TestMistralContentArray/ChatCompletionStream/MixedTextBeforeThinking', 'TestMistralContentArray/ChatCompletionStream/MixedThinkingBeforeText', 'TestMistralContentArray/ChatCompletionStream/MultipleChoicesAndToolCalls', 'TestMistralContentArray/ChatCompletionStream/NontextArray', 'TestMistralContentArray/ChatCompletionStream/NumericContent', 'TestMistralContentArray/ChatCompletionStream/TextArray', 'TestMistralContentArray/ChatCompletionStream/TextArrayAcrossFrames', 'TestMistralContentArray/ChatCompletionStream/TextArrayCustomAlias', 'TestMistralContentArray/ChatCompletionStream/TextArrayRawDisabled', 'TestMistralContentArray/ChatCompletionStream/ThinkingOnly', 'TestMistralContentArray/ChatCompletionStream/ThinkingRawDisabled', 'TestMistralContentArray/ChatCompletionStream/ThinkingThenText', 'TestMistralContentArray/ChatCompletionStream/UnknownArrayBlock', 'TestMistralContentArray/ResponsesStream/EmptyArrayControl', 'TestMistralContentArray/ResponsesStream/InvalidSecondChoice', 'TestMistralContentArray/ResponsesStream/MalformedJSON', 'TestMistralContentArray/ResponsesStream/MalformedTextBlock', 'TestMistralContentArray/ResponsesStream/MixedTextBeforeThinking', 'TestMistralContentArray/ResponsesStream/MixedThinkingBeforeText', 'TestMistralContentArray/ResponsesStream/NontextArray', 'TestMistralContentArray/ResponsesStream/NumericContent', 'TestMistralContentArray/ResponsesStream/TextArray', 'TestMistralContentArray/ResponsesStream/TextArrayAcrossFrames', 'TestMistralContentArray/ResponsesStream/TextArrayCustomAlias', 'TestMistralContentArray/ResponsesStream/TextArrayRawDisabled', 'TestMistralContentArray/ResponsesStream/ThinkingOnly', 'TestMistralContentArray/ResponsesStream/ThinkingRawDisabled', 'TestMistralContentArray/ResponsesStream/ThinkingThenText', 'TestMistralContentArray/ResponsesStream/UnknownArrayBlock'])
+          expected_pass = set(['TestMistralContentArray/ChatCompletionStream/NullControl', 'TestMistralContentArray/ChatCompletionStream/OmittedControl', 'TestMistralContentArray/ChatCompletionStream/StringControl', 'TestMistralContentArray/ResponsesStream/NullControl', 'TestMistralContentArray/ResponsesStream/OmittedControl', 'TestMistralContentArray/ResponsesStream/StringControl'])
+          if set(fixed) != set(red) or any(v != {'pass': 3, 'fail': 0, 'skip': 0} for v in fixed.values()):
+              problems.append('targeted discovery/repetition mismatch')
+          if {n for n, v in red.items() if v['fail']} != expected_fail or {n for n, v in red.items() if v['pass']} != expected_pass:
+              problems.append('parent differs from actual Windows assertion red/control ledger')
+          if any(red[n] != {'pass': 0, 'fail': 1, 'skip': 0} for n in expected_fail) or any(red[n] != {'pass': 1, 'fail': 0, 'skip': 0} for n in expected_pass):
+              problems.append('parent repetition counts differ from strict ledger')
+          if receipts['parent-red']['exit'] != 1 or not any(v['fail'] for v in red.values()) or not any(v['pass'] for v in red.values()):
+              problems.append('parent did not reproduce assertion failures with controls')
+          if int((root / 'canonical.exit').read_text()) != 0 or not list((root / 'canonical').glob('*.xml')):
+              problems.append('canonical target failed or no report')
+          xml_files = list((root / 'canonical').glob('*.xml'))
+          canonical = []
+          for xml in xml_files:
+              canonical.extend(list(ET.parse(xml).getroot().iter('testcase')))
+          canonical_names = {case.attrib['name'] for case in canonical}
+          canonical_leaves = {n for n in canonical_names if not any(o.startswith(n + '/') for o in canonical_names)}
+          if len(canonical_names) != len(canonical) or canonical_leaves != set(fixed) or any(child.tag in ('failure', 'error', 'skipped') for case in canonical for child in case):
+              problems.append('canonical XML discovery or outcomes differ')
+          receipts['canonical'] = {'nodes': len(canonical), 'leaf_count': len(canonical_leaves), 'leaves': sorted(canonical_leaves)}
+          gate_ledger = {'TestEveryLoopBoundJSONMutationIsReviewed': {'pass': 0, 'fail': 1, 'skip': 0}, 'TestCoveredSitesHaveARealTest': {'pass': 1, 'fail': 0, 'skip': 0}}
+          for label in ('fixed-gate', 'parent-gate'):
+              output = (root / (label + '.jsonl')).read_text()
+              if receipts[label]['exit'] != 1 or receipts[label]['leaves'] != gate_ledger or 'configstore.migrationMovePricingOverrideSearchContextToWebSearch' not in output or 'mistral.normalizeMistralStreamContent' in output:
+                  problems.append(label + ': baseline gate mismatch')
+          if (root / 'gate-parent-head.txt').read_text().strip() != 'e8b579fd1a710753cfa97611b5cff6c3411b0825':
+              problems.append('allocation gate parent commit mismatch')
+          (root / 'receipt.json').write_text(json.dumps({'receipts': receipts, 'problems': problems}, indent=2) + '\n')
+          print(json.dumps({'problems': problems, 'targeted_leaves': len(fixed), 'parent_failures': sum(v['fail'] for v in red.values())}))
+          if problems:
+              raise SystemExit(1)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mistral-content-array-linux-validation
+          path: validation/
+          if-no-files-found: error
