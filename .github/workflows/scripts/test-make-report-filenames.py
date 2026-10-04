@@ -130,9 +130,9 @@ class MakeReportFilenameTest(unittest.TestCase):
         for target, variables, prefix in TARGETS:
             with self.subTest(target=target, variables=variables), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
-                pattern = "Test(Alpha|Beta)/Child[0-9]:fast?*"
+                pattern = "Test(Alpha|Beta)/Child[0-9]:fast.*"
                 result, calls = self.run_target(root, target, variables, pattern=pattern)
-                self.assert_report(root, result, calls, prefix + "-Test_Alpha_Beta__Child_0-9__fast__",
+                self.assert_report(root, result, calls, prefix + "-Test_Alpha_Beta__Child_0-9__fast._",
                                    ".*" + pattern + ".*", summary=target != "test-mcp")
 
     def test_testcase_subpath_preserves_exact_selector(self):
