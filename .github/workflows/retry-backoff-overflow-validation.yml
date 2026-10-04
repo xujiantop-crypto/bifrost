@@ -1,0 +1,252 @@
+name: Retry backoff overflow offline validation
+
+on:
+  push:
+    branches: [test/retry-backoff-overflow-validation]
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_FIXED: ec9b55224b15df00de2589a112a9fe5f2c661c34
+  GOWORK: 'off'
+  GOTOOLCHAIN: local
+  GOTELEMETRY: 'off'
+  USE_INFISICAL: '0'
+  OPENAI_API_KEY: ''
+  ANTHROPIC_API_KEY: ''
+  MISTRAL_API_KEY: ''
+  GEMINI_API_KEY: ''
+  AWS_ACCESS_KEY_ID: ''
+  AWS_SECRET_ACCESS_KEY: ''
+
+jobs:
+  linux:
+    if: github.repository == 'xujiantop-crypto/bifrost'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_FIXED }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.0'
+          cache-dependency-path: core/go.sum
+      - name: Prepare exact reporting tool and public dependencies
+        run: |
+          set -euo pipefail
+          mkdir -p validation
+          test "$(git rev-parse HEAD)" = "$SOURCE_FIXED"
+          test ! -f .env
+          test -z "$(git status --porcelain)"
+          go version > validation/go-version.txt
+          go install gotest.tools/gotestsum@v1.13.0
+          gotestsum --version > validation/gotestsum-version.txt
+          (cd core && go mod download) > validation/dependency-setup.stdout.txt 2> validation/dependency-setup.stderr.txt
+          git diff --exit-code -- core/go.mod core/go.sum
+      - name: Run offline core regressions, parent red controls and canonical make
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/run-backoff-validation.py" <<'PY'
+          """Embedded in the fork-only workflow; test processes have downloads disabled."""
+          import collections
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import shutil
+          import subprocess
+          import sys
+          import time
+          import xml.etree.ElementTree as ET
+          
+          BINDING = {'source': 'ec9b55224b15df00de2589a112a9fe5f2c661c34', 'parent': '3b31be0037e1414edc4644edcba3d33011518a47', 'source_branch': 'fix/retry-backoff-overflow', 'production_blob': '75550d8823971cd475cac56037c0ee871891fcc5', 'parent_production_blob': '6f131045202581323c7ac91b904e10f8318968ad', 'test_blob': 'ff3c11fb7c1dea4ee27f3fbdd013c84c345a73a8', 'cancellation_test_blob': '02b2626dde1e37f27ceb19fdb7885ed225a7e798', 'production_sha256': 'ae75efe7ef0f0ffc7dd9cd1dad0aea5ba705d1f0d7da5416e71ba61db1fe6ef7', 'test_sha256': '4f767e8bc70f1dda4cc76db7e6fd299f08e49b4b9b14faf331ae18e1efa5b32f', 'expected_red_leaves': ['TestCalculateBackoff_OverflowBounds/HTTP_duration_multiplication_overflow', 'TestCalculateBackoff_OverflowBounds/default_multiplication_overflow', 'TestCalculateBackoff_OverflowBounds/jitter_conversion_at_duration_limit', 'TestCalculateBackoff_OverflowBounds/negative_product_at_small_cap', 'TestCalculateBackoff_OverflowBounds/product_near_duration_limit', 'TestCalculateBackoff_OverflowBounds/shift_beyond_duration_width', 'TestCalculateBackoff_OverflowBounds/signed_shift_boundary', 'TestCalculateBackoff_OverflowBounds/very_large_attempt', 'TestCalculateBackoff_OverflowBounds/zero_product_at_small_cap', 'TestExecuteRequestWithRetries_HighRetryBackoff'], 'expected_regression_leaves': ['TestCalculateBackoff_ExponentialGrowth/Attempt_0', 'TestCalculateBackoff_ExponentialGrowth/Attempt_1', 'TestCalculateBackoff_ExponentialGrowth/Attempt_10', 'TestCalculateBackoff_ExponentialGrowth/Attempt_2', 'TestCalculateBackoff_ExponentialGrowth/Attempt_3', 'TestCalculateBackoff_ExponentialGrowth/Attempt_4', 'TestCalculateBackoff_ExponentialGrowth/Attempt_5', 'TestCalculateBackoff_JitterBounds/Attempt_0_JitterBounds', 'TestCalculateBackoff_JitterBounds/Attempt_1_JitterBounds', 'TestCalculateBackoff_JitterBounds/Attempt_2_JitterBounds', 'TestCalculateBackoff_MaxBackoffCap', 'TestCalculateBackoff_OverflowBounds/HTTP_duration_multiplication_overflow', 'TestCalculateBackoff_OverflowBounds/default_multiplication_overflow', 'TestCalculateBackoff_OverflowBounds/jitter_conversion_at_duration_limit', 'TestCalculateBackoff_OverflowBounds/negative_product_at_small_cap', 'TestCalculateBackoff_OverflowBounds/product_near_duration_limit', 'TestCalculateBackoff_OverflowBounds/shift_beyond_duration_width', 'TestCalculateBackoff_OverflowBounds/signed_shift_boundary', 'TestCalculateBackoff_OverflowBounds/very_large_attempt', 'TestCalculateBackoff_OverflowBounds/zero_product_at_small_cap', 'TestExecuteRequestWithRetries_529RetriesSameKeyWithoutRotation', 'TestExecuteRequestWithRetries_AllCredentialsDeadWithinBudgetIs502', 'TestExecuteRequestWithRetries_CallerFaultDoesNotRotate/bodyless_404', 'TestExecuteRequestWithRetries_CallerFaultDoesNotRotate/context_length', 'TestExecuteRequestWithRetries_DeadKeyRepickedDoesNotExtendLoop', 'TestExecuteRequestWithRetries_EmptyStreamReturnsClosedChannel', 'TestExecuteRequestWithRetries_EncryptedContentStripRetriesOnce', 'TestExecuteRequestWithRetries_FailSoftAttemptCountsTowardRotationAccounting', 'TestExecuteRequestWithRetries_FailSoftRetrySkipsBackoff', 'TestExecuteRequestWithRetries_FilteredPoolKeepsModelError', 'TestExecuteRequestWithRetries_FilteredPoolOnGrantedAttemptKeepsUpstreamError', 'TestExecuteRequestWithRetries_HealsGeminiCorruptedThoughtSignature', 'TestExecuteRequestWithRetries_HealsOnEveryProviderRejection/anthropic', 'TestExecuteRequestWithRetries_HealsOnEveryProviderRejection/bedrock', 'TestExecuteRequestWithRetries_HealsOnEveryProviderRejection/bedrock_mantle', 'TestExecuteRequestWithRetries_HealsOnEveryProviderRejection/bedrock_non-anthropic_model', 'TestExecuteRequestWithRetries_HealsOnEveryProviderRejection/bedrock_runtime_model_switch', 'TestExecuteRequestWithRetries_HealsOnEveryProviderRejection/gemini', 'TestExecuteRequestWithRetries_HealsOnEveryProviderRejection/openai', 'TestExecuteRequestWithRetries_HealsOnEveryProviderRejection/vertex', 'TestExecuteRequestWithRetries_HealsThinkingSignatureOnChatShape', 'TestExecuteRequestWithRetries_HealsThinkingSignatureOnRawAnthropicChat', 'TestExecuteRequestWithRetries_HighRetryBackoff', 'TestExecuteRequestWithRetries_InsufficientQuotaIsPermanent', 'TestExecuteRequestWithRetries_KeyRotation/CyclesFreshRoundWhenPoolExhausted', 'TestExecuteRequestWithRetries_KeyRotation/NilKeyProviderUsesZeroKey', 'TestExecuteRequestWithRetries_KeyRotation/RotatesKeyOnRateLimitRetry', 'TestExecuteRequestWithRetries_KeyRotation/SameKeyOnNetworkError', 'TestExecuteRequestWithRetries_KeylessProviderDoesNotRetryPermanentFailure/model_not_found', 'TestExecuteRequestWithRetries_KeylessProviderDoesNotRetryPermanentFailure/region_block', 'TestExecuteRequestWithRetries_KeylessRetriesAsBefore/401_is_retried_within_the_budget', 'TestExecuteRequestWithRetries_KeylessRetriesAsBefore/404_model_not_found_is_not_retried', 'TestExecuteRequestWithRetries_KeylessRetriesAsBefore/429_quota_is_retried_within_the_budget', 'TestExecuteRequestWithRetries_LoggingAndCounting', 'TestExecuteRequestWithRetries_MixedExhaustionReturnsModelError', 'TestExecuteRequestWithRetries_ModelNotFoundRotatesAndKeepsUpstreamError', 'TestExecuteRequestWithRetries_NoStripWhenNothingEncrypted', 'TestExecuteRequestWithRetries_NonRetryableErrors/BifrostError', 'TestExecuteRequestWithRetries_NonRetryableErrors/Non-retryable_error_message', 'TestExecuteRequestWithRetries_NonRetryableErrors/Non-retryable_status_code', 'TestExecuteRequestWithRetries_NonRetryableErrors/RequestCancelled', 'TestExecuteRequestWithRetries_OrdinaryRetryPaysBackoff', 'TestExecuteRequestWithRetries_PermanentFailureBeyondBudgetKeepsUpstreamError/fixed_key', 'TestExecuteRequestWithRetries_PermanentFailureBeyondBudgetKeepsUpstreamError/two_keys,_both_rejected', 'TestExecuteRequestWithRetries_PermanentPerKeyFailureRotatesAtZeroRetries', 'TestExecuteRequestWithRetries_RegionBlockOnEveryKeyReturnsTheProviderError/max_retries_0', 'TestExecuteRequestWithRetries_RegionBlockOnEveryKeyReturnsTheProviderError/max_retries_3', 'TestExecuteRequestWithRetries_RegionBlockWalksPool', 'TestExecuteRequestWithRetries_RetryLimits/ExceedsMaxRetries', 'TestExecuteRequestWithRetries_RetryableConditions/ErrProviderDoRequest', 'TestExecuteRequestWithRetries_RetryableConditions/RateLimitMessage', 'TestExecuteRequestWithRetries_RetryableConditions/RateLimitType', 'TestExecuteRequestWithRetries_RetryableConditions/StatusCode_429', 'TestExecuteRequestWithRetries_RetryableConditions/StatusCode_500', 'TestExecuteRequestWithRetries_RetryableConditions/StatusCode_502', 'TestExecuteRequestWithRetries_RetryableConditions/StatusCode_503', 'TestExecuteRequestWithRetries_RetryableConditions/StatusCode_504', 'TestExecuteRequestWithRetries_SelectorFailureIsInternal', 'TestExecuteRequestWithRetries_StripsEncryptedContentAndRetries', 'TestExecuteRequestWithRetries_SuccessScenarios/ImmediateSuccess', 'TestExecuteRequestWithRetries_SuccessScenarios/SuccessAfterRetries', 'TestExecuteRequestWithRetries_TrailHasNoHintWhenTheProviderGaveNone', 'TestExecuteRequestWithRetries_TrailKeepsThePerAttemptRetryHint', 'TestExecuteRequestWithRetries_TransportFailureStampsTransientAndSyntheticStatus', 'TestWaitRetryBackoffReportsCancellationAtTimerExpiry'], 'expected_cancellation_leaves': ['TestRetryBackoffStopsWhenRequestCancelled', 'TestRetryBackoffStopsWhenRequestDeadlineExpires', 'TestRotationWithoutBackoffStopsWhenRequestCancelled', 'TestRotationMarkerNotSetWhenCancelledDuringBackoff']}
+          PACKAGE = "github.com/maximhq/bifrost/core"
+          REPO = Path.cwd()
+          OUT = REPO / "validation"
+          NEW_PATTERN = "^(TestCalculateBackoff_OverflowBounds|TestExecuteRequestWithRetries_HighRetryBackoff)$"
+          REGRESSION_PATTERN = "^(TestCalculateBackoff.*|TestExecuteRequestWithRetries.*|TestWaitRetryBackoffReportsCancellationAtTimerExpiry)$"
+          CANCELLATION_PATTERN = "^(TestRetryBackoffStopsWhenRequestCancelled|TestRetryBackoffStopsWhenRequestDeadlineExpires|TestRotationWithoutBackoffStopsWhenRequestCancelled|TestRotationMarkerNotSetWhenCancelledDuringBackoff)$"
+          CANONICAL_PATTERN = "CalculateBackoff|ExecuteRequestWithRetries|WaitRetryBackoffReportsCancellationAtTimerExpiry"
+          
+          
+          def git(*args):
+              return subprocess.check_output(["git", *args], encoding="utf-8").strip()
+          
+          
+          def sha256(path):
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+          
+          
+          def write_json(path, value):
+              path.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+          
+          
+          def leaf_names(names):
+              return {name for name in names if not any(other.startswith(name + "/") for other in names)}
+          
+          
+          def run(label, command, *, cwd=None, additions=None, timeout=1200):
+              env = os.environ.copy()
+              env.update({"GOWORK": "off", "GOTOOLCHAIN": "local", "GOTELEMETRY": "off", "GOPROXY": "off", "GOSUMDB": "off", "GOFLAGS": "-mod=readonly", "USE_INFISICAL": "0", "CI": "1"})
+              env.pop("GOARCH", None)
+              env.pop("GOOS", None)
+              if additions:
+                  env.update(additions)
+              started = time.time()
+              with (OUT / (label + ".stdout.txt")).open("wb") as stdout, (OUT / (label + ".stderr.txt")).open("wb") as stderr:
+                  try:
+                      process = subprocess.run(command, cwd=cwd or REPO, env=env, stdout=stdout, stderr=stderr, timeout=timeout)
+                      result = process.returncode
+                  except subprocess.TimeoutExpired:
+                      result = 124
+              (OUT / (label + ".exit")).write_text(str(result) + "\n")
+              write_json(OUT / (label + ".command.json"), {"command": command, "cwd": str(cwd or REPO), "environment_overrides": {k: env[k] for k in ("GOWORK", "GOTOOLCHAIN", "GOTELEMETRY", "GOPROXY", "GOSUMDB", "GOFLAGS", "USE_INFISICAL", "CI")}, "GOARCH": env.get("GOARCH", "native"), "CGO_ENABLED": env.get("CGO_ENABLED", "default"), "exit": result, "duration_seconds": time.time() - started, "stdout_sha256": sha256(OUT / (label + ".stdout.txt")), "stderr_sha256": sha256(OUT / (label + ".stderr.txt"))})
+              return result
+          
+          
+          def parse_go(label, path=None):
+              path = path or OUT / (label + ".stdout.txt")
+              events = []
+              for line in path.read_text(encoding="utf-8").splitlines():
+                  if line.startswith("{"):
+                      events.append(json.loads(line))
+              tests = {(e.get("Package", ""), e["Test"]) for e in events if "Test" in e}
+              leaves = {(pkg, name) for pkg, name in tests if not any(p == pkg and n.startswith(name + "/") for p, n in tests)}
+              counts = collections.Counter((e.get("Package", ""), e.get("Test", ""), e.get("Action")) for e in events if e.get("Action") in ("pass", "fail", "skip"))
+              outcomes = {pkg + "::" + name: {action: counts[(pkg, name, action)] for action in ("pass", "fail", "skip")} for pkg, name in sorted(leaves)}
+              packages = {pkg: {action: counts[(pkg, "", action)] for action in ("pass", "fail", "skip")} for pkg in sorted({e["Package"] for e in events if "Package" in e})}
+              outputs = collections.defaultdict(str)
+              for event in events:
+                  if "Test" in event:
+                      outputs[event["Test"]] += event.get("Output", "")
+              summary = {"exit": int((OUT / (label + ".exit")).read_text()), "events": len(events), "leaves": outcomes, "leaf_count": len(leaves), "packages": packages, "all_skips": sum(e.get("Action") == "skip" for e in events), "all_test_failures": sum(e.get("Action") == "fail" and "Test" in e for e in events), "build_failures": sum(e.get("Action") in ("build-fail", "build-failed") for e in events), "test_packages": sorted({pkg for pkg, _ in tests}), "stdout_sha256": sha256(path), "stderr_sha256": sha256(OUT / (label + ".stderr.txt"))}
+              return summary, outputs
+          
+          
+          def check_go(summary, expected, *, red=False):
+              errors = []
+              wanted = {PACKAGE + "::" + name for name in expected}
+              if set(summary["leaves"]) != wanted:
+                  errors.append("test discovery differs from exact ledger")
+              desired = {"pass": 0, "fail": 1, "skip": 0} if red else {"pass": 1, "fail": 0, "skip": 0}
+              if any(value != desired for value in summary["leaves"].values()):
+                  errors.append("leaf outcome differs from exact assertion ledger")
+              if summary["exit"] != (1 if red else 0):
+                  errors.append("unexpected process exit")
+              if summary["all_skips"] or summary["build_failures"] or not summary["events"]:
+                  errors.append("skipped tests, build failure, or empty gojson")
+              package_desired = {"pass": 0, "fail": 1, "skip": 0} if red else {"pass": 1, "fail": 0, "skip": 0}
+              if summary["packages"].get(PACKAGE) != package_desired:
+                  errors.append("root core package terminal outcome missing or incorrect")
+              if summary["test_packages"] != [PACKAGE]:
+                  errors.append("unexpected matching tests outside the offline root package")
+              if not red and summary["all_test_failures"]:
+                  errors.append("green command contains a test failure")
+              return errors
+          
+          
+          def main():
+              OUT.mkdir(exist_ok=True)
+              assert git("rev-parse", "HEAD") == BINDING["source"] == os.environ["SOURCE_FIXED"]
+              assert git("rev-parse", "HEAD^") == BINDING["parent"]
+              assert subprocess.check_output(["go", "version"], encoding="utf-8").strip().split()[2] == "go1.27.0"
+              assert not (REPO / ".env").exists()
+              paths = {"production": "core/utils.go", "test": "core/bifrost_test.go", "cancellation_test": "core/streamfallback_test.go"}
+              original = (REPO / paths["production"]).read_bytes()
+              binding_before = {}
+              for name, relative in paths.items():
+                  blob = git("hash-object", relative)
+                  assert blob == BINDING[name + "_blob"]
+                  binding_before[name] = {"path": relative, "git_blob": blob, "sha256": sha256(REPO / relative)}
+              assert binding_before["production"]["sha256"] == BINDING["production_sha256"]
+              assert binding_before["test"]["sha256"] == BINDING["test_sha256"]
+              write_json(OUT / "source-binding.json", {"source": BINDING["source"], "parent": BINDING["parent"], "parent_production_blob": BINDING["parent_production_blob"], "files": binding_before, "source_author_committer": git("show", "-s", "--format=%an%n%ae%n%cn%n%ce", "HEAD").splitlines()})
+              (OUT / "source.txt").write_text(git("show", "-s", "--format=fuller", "HEAD") + "\n")
+              test_command = ["go", "test", "-json", "-count=1", "-timeout=3m"]
+              run("fixed-regression-race", test_command + ["-race", "-vet=all", "-run", REGRESSION_PATTERN, "."], cwd=REPO / "core")
+              run("fixed-cancellation-race", test_command + ["-race", "-vet=all", "-run", CANCELLATION_PATTERN, "."], cwd=REPO / "core")
+              run("fixed-new-386", test_command + ["-vet=all", "-run", NEW_PATTERN, "."], cwd=REPO / "core", additions={"GOARCH": "386", "CGO_ENABLED": "0"})
+          
+              parent = subprocess.check_output(["git", "show", BINDING["parent"] + ":core/utils.go"])
+              try:
+                  (REPO / paths["production"]).write_bytes(parent)
+                  assert git("hash-object", paths["production"]) == BINDING["parent_production_blob"]
+                  assert git("hash-object", paths["test"]) == BINDING["test_blob"]
+                  write_json(OUT / "parent-binding.json", {"parent": BINDING["parent"], "production_blob": git("hash-object", paths["production"]), "production_sha256": sha256(REPO / paths["production"]), "test_blob": git("hash-object", paths["test"]), "test_sha256": sha256(REPO / paths["test"]), "method": "exact parent core/utils.go; current committed regression tests retained"})
+                  run("parent-red-amd64", test_command + ["-vet=all", "-run", NEW_PATTERN, "."], cwd=REPO / "core")
+                  run("parent-red-386", test_command + ["-vet=all", "-run", NEW_PATTERN, "."], cwd=REPO / "core", additions={"GOARCH": "386", "CGO_ENABLED": "0"})
+              finally:
+                  (REPO / paths["production"]).write_bytes(original)
+                  assert git("hash-object", paths["production"]) == BINDING["production_blob"]
+                  assert sha256(REPO / paths["production"]) == BINDING["production_sha256"]
+                  assert git("hash-object", paths["test"]) == BINDING["test_blob"]
+                  subprocess.run(["git", "diff", "--exit-code", "--", *paths.values()], check=True)
+                  write_json(OUT / "restored-source.json", {"restored": True, "production_blob": git("hash-object", paths["production"]), "production_sha256": sha256(REPO / paths["production"]), "test_blob": git("hash-object", paths["test"]), "test_sha256": sha256(REPO / paths["test"])})
+          
+              # Add raw gojson reporting to the unchanged canonical make command.
+              # The wrapper forwards all make-provided arguments to the pinned gotestsum.
+              actual_gotestsum = shutil.which("gotestsum")
+              assert actual_gotestsum
+              wrapper_dir = Path(os.environ["RUNNER_TEMP"]) / "backoff-validation-bin"
+              wrapper_dir.mkdir(exist_ok=True)
+              wrapper = wrapper_dir / "gotestsum"
+              wrapper.write_text('#!/bin/sh\nexec "$VALIDATION_REAL_GOTESTSUM" --jsonfile="$VALIDATION_CANONICAL_JSONFILE" "$@"\n')
+              wrapper.chmod(0o755)
+              canonical_env = {"PATH": str(wrapper_dir) + os.pathsep + os.environ["PATH"], "VALIDATION_REAL_GOTESTSUM": actual_gotestsum, "VALIDATION_CANONICAL_JSONFILE": str(OUT / "canonical.jsonl")}
+              run("canonical", ["make", "test-core", "PATTERN=" + CANONICAL_PATTERN, "TEST_REPORTS_DIR=validation/canonical"], additions=canonical_env, timeout=1800)
+              subprocess.run(["git", "diff", "--exit-code"], check=True)
+          
+              summaries = {}
+              problems = []
+              stages = {
+                  "fixed-regression-race": (BINDING["expected_regression_leaves"], False),
+                  "fixed-cancellation-race": (BINDING["expected_cancellation_leaves"], False),
+                  "fixed-new-386": (BINDING["expected_red_leaves"], False),
+                  "parent-red-amd64": (BINDING["expected_red_leaves"], True),
+                  "parent-red-386": (BINDING["expected_red_leaves"], True),
+                  "canonical": (BINDING["expected_regression_leaves"], False),
+              }
+              for label, (expected, red) in stages.items():
+                  try:
+                      summary, outputs = parse_go(label, OUT / "canonical.jsonl" if label == "canonical" else None)
+                      summaries[label] = summary
+                      problems.extend(label + ": " + error for error in check_go(summary, expected, red=red))
+                      if red:
+                          for test in expected:
+                              output = outputs[test]
+                              phrase = "outside capped jitter range" if test.startswith("TestCalculateBackoff_OverflowBounds/") else "retry delay"
+                              if phrase not in output:
+                                  problems.append(label + ": expected overflow assertion missing for " + test)
+                  except (FileNotFoundError, ValueError, KeyError) as error:
+                      problems.append(label + ": incomplete or malformed evidence: " + str(error))
+              xml_files = list((OUT / "canonical").glob("*.xml"))
+              try:
+                  assert len(xml_files) == 1, "expected exactly one canonical XML report"
+                  cases = list(ET.parse(xml_files[0]).getroot().iter("testcase"))
+                  names = {case.attrib["name"] for case in cases}
+                  assert len(names) == len(cases), "duplicate canonical XML testcase"
+                  assert leaf_names(names) == set(BINDING["expected_regression_leaves"]), "canonical XML differs from direct regression ledger"
+                  assert not any(child.tag in ("failure", "error", "skipped") for case in cases for child in case), "failed/skipped canonical XML"
+                  summaries["canonical_xml"] = {"path": str(xml_files[0].relative_to(OUT)), "sha256": sha256(xml_files[0]), "nodes": len(cases), "leaves": sorted(leaf_names(names)), "leaf_count": len(leaf_names(names))}
+              except (AssertionError, ET.ParseError, KeyError) as error:
+                  problems.append("canonical XML: " + str(error))
+              receipt = {"binding": BINDING, "summaries": summaries, "problems": problems, "live_provider_calls": False, "live_provider_harness": False, "new_tcp_fixture": False, "existing_mock_cancellation_tests": True, "dependency_downloads_during_tests": False, "canonical_scope": "make test-core with PATTERN and no PROVIDER includes root core . plus providers; only root package contains matching tests"}
+              write_json(OUT / "receipt.json", receipt)
+              print(json.dumps({"problems": problems, "stages": {name: {"exit": item.get("exit"), "leaves": item.get("leaf_count")} for name, item in summaries.items()}}))
+              return bool(problems)
+          
+          
+          if __name__ == "__main__":
+              sys.exit(main())
+          PY
+          python3 "$RUNNER_TEMP/run-backoff-validation.py"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: retry-backoff-overflow-linux-validation
+          path: validation/
+          if-no-files-found: error
