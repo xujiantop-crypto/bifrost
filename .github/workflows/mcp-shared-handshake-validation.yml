@@ -1,0 +1,264 @@
+name: MCP shared HTTP handshake validation
+
+on:
+  push:
+    branches: [test/mcp-shared-handshake-validation]
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_FIXED: e5b219880bf4194d87b02785da6ad47a96722673
+  GOWORK: 'off'
+  GOTOOLCHAIN: local
+  GOTELEMETRY: 'off'
+  MCP_USE_REMOTE: '0'
+  OPENAI_API_KEY: ''
+  USE_INFISICAL: '0'
+
+jobs:
+  linux:
+    if: github.repository == 'xujiantop-crypto/bifrost'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_FIXED }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.0'
+          cache-dependency-path: |
+            core/go.sum
+            examples/mcps/*/go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Record reviewed source and install reporting tool
+        run: |
+          set -euo pipefail
+          mkdir -p validation
+          test "$(git rev-parse HEAD)" = "$SOURCE_FIXED"
+          git show --no-patch --format=fuller HEAD > validation/source.txt
+          git rev-parse "${SOURCE_FIXED}^" > validation/parent.txt
+          git rev-parse "${SOURCE_FIXED}:core/mcp/clientmanager.go" > validation/fixed-production-blob.txt
+          git rev-parse "${SOURCE_FIXED}^:core/mcp/clientmanager.go" > validation/parent-production-blob.txt
+          go version > validation/go-version.txt
+          node --version > validation/node-version.txt
+          # No provider credentials or .env profile is consumed by this workflow.
+          test ! -f .env
+          go install gotest.tools/gotestsum@v1.12.0
+
+      - name: Fixed handshake regressions three times
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          set +e
+          (cd core && go test -json -race -vet=all -count=3 -timeout=60s -run '^TestAddClientSharedHTTPHandshake$' ./mcp) > validation/fixed-targeted.jsonl 2> validation/fixed-targeted.stderr
+          result=$?
+          printf '%s\n' "$result" > validation/fixed-targeted.exit
+          exit "$result"
+
+      - name: Complete MCP unit package with race and vet
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          set +e
+          (cd core && go test -json -race -vet=all -count=1 -timeout=5m ./mcp) > validation/fixed-full-mcp.jsonl 2> validation/fixed-full-mcp.stderr
+          result=$?
+          printf '%s\n' "$result" > validation/fixed-full-mcp.exit
+          exit "$result"
+
+      - name: Exact example module fixture with race and vet
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          set +e
+          (cd examples/mcps/http-no-ping-server && go test -json -race -vet=all -count=3 -timeout=60s -run '^TestHandshakeRetryFixture$' .) > validation/fixture.jsonl 2> validation/fixture.stderr
+          result=$?
+          printf '%s\n' "$result" > validation/fixture.exit
+          exit "$result"
+
+      - name: Exact parent production overlay must reproduce one failure
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          cp core/mcp/clientmanager.go "$RUNNER_TEMP/fixed-clientmanager.go"
+          trap 'cp "$RUNNER_TEMP/fixed-clientmanager.go" core/mcp/clientmanager.go' EXIT
+          git show "${SOURCE_FIXED}^:core/mcp/clientmanager.go" > core/mcp/clientmanager.go
+          test "$(git hash-object core/mcp/clientmanager.go)" = "$(cat validation/parent-production-blob.txt)"
+          set +e
+          (cd core && go test -json -count=1 -timeout=60s -run '^TestAddClientSharedHTTPHandshake$' ./mcp) > validation/parent-red.jsonl 2> validation/parent-red.stderr
+          result=$?
+          set -e
+          printf '%s\n' "$result" > validation/parent-red.exit
+          cp "$RUNNER_TEMP/fixed-clientmanager.go" core/mcp/clientmanager.go
+          trap - EXIT
+          git diff --exit-code -- core/mcp/clientmanager.go
+          # Detailed JSON assertions below require exactly the expected red leaf
+          # and all four controls passing, so a compile error cannot satisfy this.
+          test "$result" = 1
+
+      - name: Build only local servers needed by scoped canonical MCP tests
+        run: |
+          set -euo pipefail
+          # These are the exact per-module Go build commands setup-mcp-tests uses.
+          # The scoped hooks use in-process servers. HTTP/SSE use TestMain's
+          # remote-test-server on dynamically allocated local ports. The mixed
+          # transport and process-respawn controls spawn go-test-server as STDIO.
+          # No TypeScript fixture is selected, so the unrelated examples are not built.
+          for server in remote-test-server go-test-server; do
+            mkdir -p "examples/mcps/$server/bin"
+            (cd "examples/mcps/$server" && GOWORK=off go build -o "bin/$server" .)
+            test -x "examples/mcps/$server/bin/$server"
+          done
+
+      - name: Canonical scoped hooks and real transport boundaries
+        run: |
+          set -euo pipefail
+          run_canonical() {
+            local label="$1"
+            shift
+            set +e
+            make -o setup-mcp-tests test-mcp TEST_REPORTS_DIR="validation/$label" "$@" 2>&1 | tee "validation/$label.log"
+            local result="${PIPESTATUS[0]}"
+            set -e
+            printf '%s\n' "$result" > "validation/$label.exit"
+          }
+          # -o suppresses only the already-completed setup prerequisite. The
+          # repository's actual test-mcp recipe and its gotestsum/-race flags run.
+          run_canonical hooks TYPE=connect_ping_listtools PATTERN='ConnectHook|ListToolsHook|PingHook|MCPGate'
+          run_canonical connections TYPE=connection PATTERN='^Test(InProcessConnection|InProcessToolExecution|HTTPConnection|SSEConnection|SSEConnectionReconnect)$'
+          run_canonical mixed TYPE=http_stdio_mix
+          run_canonical respawn TESTCASE=TestSTDIOSubprocessKilled_CheckerRespawnsIt
+
+      - name: Verify JSON and JUnit counts and expected red cause
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import collections
+          import json
+          import pathlib
+          import xml.etree.ElementTree as ET
+
+          root = pathlib.Path('validation')
+          receipts = {}
+          problems = []
+          parent = 'TestAddClientSharedHTTPHandshake'
+          leaves = [
+              'recovers_after_initialized_notification_503',
+              'recovers_after_initialize_response_503',
+              'does_not_retry_permanent_notification_failure',
+              'bounds_transient_attempts',
+              'manager_cancellation_stops_handshake_and_closes_session',
+          ]
+
+          def rows(label):
+              content = (root / (label + '.jsonl')).read_text()
+              return [json.loads(line) for line in content.splitlines() if line.startswith('{')]
+
+          def verify_go(label, expected_exit=0):
+              records = rows(label)
+              assert int((root / (label + '.exit')).read_text()) == expected_exit, label + ' exit'
+              done = [r for r in records if r.get('Test') and r['Action'] in ('pass', 'fail', 'skip')]
+              counts = collections.Counter((r['Test'], r['Action']) for r in done)
+              assert done, label + ' executed zero tests'
+              assert not any(r['Action'] == 'skip' for r in done), label + ' skipped tests'
+              if not expected_exit:
+                  assert not any(r['Action'] == 'fail' for r in done), label + ' failed tests'
+                  assert any(r['Action'] == 'pass' and not r.get('Test') for r in records), label + ' package not successful'
+              receipts[label] = {
+                  'exit': expected_exit,
+                  'completed': dict(collections.Counter(r['Action'] for r in done)),
+                  'top_level': dict(collections.Counter(r['Action'] for r in done if '/' not in r['Test'])),
+                  'subtests': dict(collections.Counter(r['Action'] for r in done if '/' in r['Test'])),
+                  'failed': [r['Test'] for r in done if r['Action'] == 'fail'],
+                  'skipped': [r['Test'] for r in done if r['Action'] == 'skip'],
+              }
+              return records, counts
+
+          def check(label, fn):
+              try:
+                  fn()
+              except Exception as exc:
+                  problems.append(label + ': ' + str(exc))
+
+          def fixed_targeted():
+              _, counts = verify_go('fixed-targeted')
+              assert counts[(parent, 'pass')] == 3
+              for leaf in leaves:
+                  assert counts[(parent + '/' + leaf, 'pass')] == 3, leaf
+
+          def full_package():
+              _, counts = verify_go('fixed-full-mcp')
+              assert sum(n for (name, action), n in counts.items() if '/' not in name and action == 'pass') >= 200
+              for name in [
+                  'TestConnectToMCPClient_MakeBeforeBreak_ServesDuringDialAndClosesOldConn',
+                  'TestConnectToMCPClient_MakeBeforeBreak_ConcurrentCallsAcrossSwap',
+                  'TestConnectToMCPClient_MakeBeforeBreak_DialFailure_KeepsLiveConnectionServing',
+                  'TestHandleSSEConnectionLost_StaleGenerationNoOp',
+                  'TestSSEStreamDropped_CheckerReconnects',
+              ]:
+                  assert counts[(name, 'pass')] == 1, name
+
+          def example_fixture():
+              _, counts = verify_go('fixture')
+              assert counts[('TestHandshakeRetryFixture', 'pass')] == 3
+
+          def parent_red():
+              records, counts = verify_go('parent-red', 1)
+              expected = parent + '/' + leaves[0]
+              failed = [r['Test'] for r in records if r.get('Test') and r['Action'] == 'fail']
+              assert sorted(failed) == sorted([expected, parent]), failed
+              assert counts[(expected, 'fail')] == 1
+              for leaf in leaves[1:]:
+                  assert counts[(parent + '/' + leaf, 'pass')] == 1, leaf
+              text = ''.join(r.get('Output', '') for r in records if r.get('Test') == expected)
+              assert 'status 400' in text and 'session already initialized' in text, text
+              assert 'method:initialize session:session-1' in text, text
+
+          def canonical(label, required):
+              assert int((root / (label + '.exit')).read_text()) == 0, label + ' make exit'
+              files = list((root / label).glob('*.xml'))
+              assert len(files) == 1, (label, files)
+              cases = list(ET.parse(files[0]).getroot().iter('testcase'))
+              assert cases, label + ' executed zero JUnit cases'
+              bad = [c.attrib for c in cases if c.find('failure') is not None or c.find('error') is not None or c.find('skipped') is not None]
+              assert not bad, bad
+              names = {c.attrib['name'] for c in cases}
+              for name in required:
+                  assert name in names, (label, name, sorted(names))
+              receipts[label] = {'make_exit': 0, 'junit_cases': len(cases), 'failed': [], 'skipped': [], 'names': sorted(names)}
+
+          check('fixed-targeted', fixed_targeted)
+          check('fixed-full-mcp', full_package)
+          check('fixture', example_fixture)
+          check('parent-red', parent_red)
+          check('hooks', lambda: canonical('hooks', [
+              'TestConnectHook_FiresOnAddClient', 'TestConnectHook_PostHookPopulatesServerInfo',
+              'TestConnectHook_PreHookShortCircuitError_FailsAddClient',
+              'TestListToolsHook_FiresOnConnectAndAgain', 'TestPingHook_FiresViaHealthMonitor',
+              'TestMCPGate_NoPluginsConfigured_OpStillRuns',
+          ]))
+          check('connections', lambda: canonical('connections', [
+              'TestInProcessConnection', 'TestInProcessToolExecution',
+              'TestHTTPConnection', 'TestSSEConnection', 'TestSSEConnectionReconnect',
+          ]))
+          check('mixed', lambda: canonical('mixed', ['TestHTTP_STDIO_Mix']))
+          check('respawn', lambda: canonical('respawn', ['TestSTDIOSubprocessKilled_CheckerRespawnsIt']))
+          root.mkdir(exist_ok=True)
+          result = {'receipts': receipts, 'problems': problems}
+          (root / 'receipt.json').write_text(json.dumps(result, indent=2) + '\n')
+          print(json.dumps(result, indent=2))
+          if problems:
+              raise SystemExit(1)
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mcp-shared-http-handshake-linux-validation
+          path: validation/
+          if-no-files-found: error
