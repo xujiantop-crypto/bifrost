@@ -1,0 +1,304 @@
+name: Make report filename offline validation
+
+on:
+  push:
+    branches: [test/report-pattern-filenames-validation]
+
+permissions:
+  contents: read
+
+env:
+  RED_ONLY: '1'
+  EXPECTED_MAKEFILE_SHA256: 0b3fb500c52935b429f1ea6b9577f7c54e85093dd1b3f36c3edc03732225c106
+  EXPECTED_TEST_SHA256: 6c5b69f05eec0b219b1637a05f0fac083ba330e6f7afdbb553acf89841e1bf2f
+  USE_INFISICAL: '0'
+  PYTHONDONTWRITEBYTECODE: '1'
+
+jobs:
+  offline:
+    if: github.repository == 'xujiantop-crypto/bifrost'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /Makefile
+            /.github/workflows/scripts/test-make-report-filenames.py
+      - name: Actual GNU make regression with bound source and per-leaf evidence
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          cat > "$RUNNER_TEMP/report-filename-validation.py" <<'PY'
+          """Fork-only evidence runner for real GNU make regression, with no live requests."""
+          import collections
+          import hashlib
+          import importlib.util
+          import json
+          import os
+          from pathlib import Path
+          import platform
+          import subprocess
+          import sys
+          import traceback
+          import unittest
+
+
+          BASE = "3b31be0037e1414edc4644edcba3d33011518a47"
+          BASE_MAKEFILE_SHA256 = "0b3fb500c52935b429f1ea6b9577f7c54e85093dd1b3f36c3edc03732225c106"
+          BASE_MAKEFILE_BLOB = "8baa2a918f66eef9584710afd7823c9b4642ce5a"
+          TEST_PATH = ".github/workflows/scripts/test-make-report-filenames.py"
+          REPO = Path.cwd()
+          OUT = REPO / "report-filename-proof"
+          METHODS = {
+              "test_alternation_preserves_selector_and_prints_summary": 5,
+              "test_subtest_regex_produces_one_portable_filename": 5,
+              "test_testcase_subpath_preserves_exact_selector": 4,
+              "test_plain_pattern_keeps_legacy_filename": 5,
+              "test_unfiltered_reports_keep_legacy_filename": 5,
+              "test_failing_filtered_run_still_returns_failure": 5,
+              "test_html_viewer_receives_same_generated_report": 5,
+          }
+          CONTROLS = {"test_plain_pattern_keeps_legacy_filename", "test_unfiltered_reports_keep_legacy_filename"}
+
+
+          def digest(data):
+              return hashlib.sha256(data).hexdigest()
+
+
+          def sha256(path):
+              return digest(path.read_bytes())
+
+
+          def write_json(path, value):
+              path.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+
+
+          def git(*args):
+              return subprocess.check_output(["git", *args], text=True).strip()
+
+
+          class LedgerResult(unittest.TextTestResult):
+              def __init__(self, *args, **kwargs):
+                  super().__init__(*args, **kwargs)
+                  self.leaves = []
+                  self.subtest_parents = set()
+
+              def addSubTest(self, test, subtest, err):
+                  self.subtest_parents.add(test.id())
+                  status = "pass" if err is None else "fail" if issubclass(err[0], test.failureException) else "error"
+                  self.leaves.append({"id": subtest.id(), "method": test._testMethodName,
+                                      "parameters": dict(subtest.params), "status": status,
+                                      "exception_type": None if err is None else err[0].__name__,
+                                      "trace": None if err is None else self._exc_info_to_string(err, test)})
+                  super().addSubTest(test, subtest, err)
+
+              def addSuccess(self, test):
+                  if test.id() not in self.subtest_parents:
+                      self.leaves.append({"id": test.id(), "method": test._testMethodName, "status": "pass"})
+                  super().addSuccess(test)
+
+              def addFailure(self, test, err):
+                  self.leaves.append({"id": test.id(), "method": test._testMethodName, "status": "fail",
+                                      "exception_type": err[0].__name__, "trace": self._exc_info_to_string(err, test)})
+                  super().addFailure(test, err)
+
+              def addError(self, test, err):
+                  self.leaves.append({"id": test.id(), "method": test._testMethodName, "status": "error",
+                                      "exception_type": err[0].__name__, "trace": self._exc_info_to_string(err, test)})
+                  super().addError(test, err)
+
+              def addSkip(self, test, reason):
+                  self.leaves.append({"id": test.id(), "method": test._testMethodName, "status": "skip", "reason": reason})
+                  super().addSkip(test, reason)
+
+
+          def worker(label, makefile):
+              destination = OUT / label
+              destination.mkdir(parents=True, exist_ok=True)
+              os.environ["BIFROST_TEST_MAKEFILE"] = str(makefile)
+              spec = importlib.util.spec_from_file_location("report_filename_regression", REPO / TEST_PATH)
+              module = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(module)
+              original = module.MakeReportFilenameTest.run_target
+              receipts = []
+
+              def captured_target(self, root, target, variables, **options):
+                  # The regression already guards go and infisical. Guard other build tools
+                  # too, while preserving its exact source and actual Makefile execution.
+                  binaries = root / "bin"
+                  binaries.mkdir(parents=True, exist_ok=True)
+                  guard = '#!' + sys.executable + '\nfrom pathlib import Path\nimport os\nimport sys\nPath(os.environ["FIXTURE_ROOT"], "unexpected-command").touch()\nsys.exit(93)\n'
+                  for tool in ("npm", "dlv"):
+                      path = binaries / tool
+                      path.write_text(guard, encoding="utf-8")
+                      path.chmod(0o755)
+                  result, calls = original(self, root, target, variables, **options)
+                  case_id = self._subtest.id() if self._subtest is not None else self.id()
+                  case = destination / "make-calls" / ("%02d" % (len(receipts) + 1))
+                  case.mkdir(parents=True)
+                  (case / "stdout.txt").write_text(result.stdout, encoding="utf-8")
+                  (case / "stderr.txt").write_text(result.stderr, encoding="utf-8")
+                  reports = []
+                  for report in sorted((root / "test-reports").rglob("*")):
+                      if not report.is_file():
+                          continue
+                      # Original red basenames contain pipes. Keep exact bytes under safe
+                      # artifact filenames and retain the original path in the receipt.
+                      saved = case / ("report-%02d.bin" % len(reports))
+                      saved.write_bytes(report.read_bytes())
+                      reports.append({"fixture_path": str(report.relative_to(root)), "saved": str(saved.relative_to(OUT)),
+                                      "sha256": sha256(saved), "bytes": saved.stat().st_size})
+                  command = ["make", "--no-print-directory", "--assume-old=setup-mcp-tests", target,
+                             "DEBUG=", "PROVIDER=", "TYPE=", "TEST_REPORTS_DIR=test-reports",
+                             "PATTERN=" + options.get("pattern", ""), "TESTCASE=" + options.get("testcase", "")]
+                  command.extend(key + "=" + value for key, value in variables.items())
+                  receipt = {"id": case_id, "command": command, "fixture_cwd": str(root), "options": options,
+                             "exit": result.returncode, "calls": calls, "reports": reports,
+                             "stdout_sha256": sha256(case / "stdout.txt"), "stderr_sha256": sha256(case / "stderr.txt"),
+                             "source_makefile_sha256": sha256(makefile)}
+                  write_json(case / "receipt.json", receipt)
+                  receipts.append(receipt)
+                  return result, calls
+
+              module.MakeReportFilenameTest.run_target = captured_target
+              suite = unittest.defaultTestLoader.loadTestsFromModule(module)
+              result = unittest.TextTestRunner(stream=sys.stderr, verbosity=2, resultclass=LedgerResult).run(suite)
+              ledger = {"label": label, "methods": result.testsRun, "leaves": result.leaves,
+                        "counts": dict(collections.Counter(leaf["status"] for leaf in result.leaves)),
+                        "failures": [{"id": test.id(), "trace": trace} for test, trace in result.failures],
+                        "errors": [{"id": test.id(), "trace": trace} for test, trace in result.errors],
+                        "skipped": [{"id": test.id(), "reason": reason} for test, reason in result.skipped],
+                        "invocations": len(receipts), "makefile_sha256": sha256(makefile),
+                        "test_sha256": sha256(REPO / TEST_PATH), "successful": result.wasSuccessful()}
+              write_json(destination / "ledger.json", ledger)
+              print(json.dumps({"label": label, "methods": ledger["methods"], "counts": ledger["counts"],
+                                "invocations": len(receipts)}))
+              return 0 if result.wasSuccessful() else 1
+
+
+          def validate_stage(label, makefile, red):
+              destination = OUT / label
+              destination.mkdir(parents=True, exist_ok=True)
+              command = [sys.executable, str(Path(__file__).resolve()), "--stage", label, str(makefile)]
+              env = os.environ.copy()
+              env.update({"USE_INFISICAL": "0", "CI": "1", "PYTHONDONTWRITEBYTECODE": "1"})
+              with (destination / "stdout.txt").open("wb") as stdout, (destination / "stderr.txt").open("wb") as stderr:
+                  process = subprocess.run(command, env=env, stdout=stdout, stderr=stderr, timeout=600)
+              ledger = json.loads((destination / "ledger.json").read_text(encoding="utf-8"))
+              problems = []
+              counts = collections.Counter(leaf["status"] for leaf in ledger["leaves"])
+              expected_counts = {"pass": 10, "fail": 24} if red else {"pass": 34}
+              if dict(counts) != expected_counts:
+                  problems.append("unexpected leaf outcomes: " + str(dict(counts)))
+              if process.returncode != (1 if red else 0):
+                  problems.append("unexpected unittest process exit")
+              if ledger["methods"] != 7 or len(ledger["leaves"]) != 34 or ledger["invocations"] != 34:
+                  problems.append("test method, leaf, or actual make invocation count differs")
+              if ledger["errors"] or ledger["skipped"]:
+                  problems.append("unittest setup/error/skip is not assertion evidence")
+              if collections.Counter(leaf["method"] for leaf in ledger["leaves"]) != METHODS:
+                  problems.append("method discovery differs from exact ledger")
+              if len({leaf["id"] for leaf in ledger["leaves"]}) != 34:
+                  problems.append("duplicate leaf IDs")
+              for leaf in ledger["leaves"]:
+                  expected = "pass" if not red or leaf["method"] in CONTROLS else "fail"
+                  if leaf["status"] != expected:
+                      problems.append("unexpected outcome for " + leaf["id"])
+                  if leaf["status"] == "fail" and leaf.get("exception_type") != "AssertionError":
+                      problems.append("expected regression assertion absent for " + leaf["id"])
+              if ledger["makefile_sha256"] != sha256(makefile) or ledger["test_sha256"] != sha256(REPO / TEST_PATH):
+                  problems.append("source binding changed during test")
+              write_json(destination / "command.json", {"command": command, "exit": process.returncode,
+                                                         "stdout_sha256": sha256(destination / "stdout.txt"),
+                                                         "stderr_sha256": sha256(destination / "stderr.txt"),
+                                                         "red_expected": red, "problems": problems})
+              return ledger, problems
+
+
+          def main():
+              if len(sys.argv) == 4 and sys.argv[1] == "--stage":
+                  return worker(sys.argv[2], Path(sys.argv[3]))
+              OUT.mkdir(exist_ok=True)
+              problems = []
+              assert not (REPO / ".env").exists()
+              assert git("status", "--porcelain", "--untracked-files=no") == ""
+              head = git("rev-parse", "HEAD")
+              red_only = os.environ["RED_ONLY"] == "1"
+              current_makefile = REPO / "Makefile"
+              test = REPO / TEST_PATH
+              assert sha256(current_makefile) == os.environ["EXPECTED_MAKEFILE_SHA256"]
+              assert sha256(test) == os.environ["EXPECTED_TEST_SHA256"]
+              parent_bytes = subprocess.check_output(["git", "show", BASE + ":Makefile"])
+              assert digest(parent_bytes) == BASE_MAKEFILE_SHA256
+              assert git("rev-parse", BASE + ":Makefile") == BASE_MAKEFILE_BLOB
+              baseline = OUT / "parent.Makefile"
+              baseline.write_bytes(parent_bytes)
+              tools = {}
+              for tool in ("make", "bash", "python3"):
+                  tools[tool] = subprocess.check_output([tool, "--version"], text=True, stderr=subprocess.STDOUT)
+              assert "GNU Make" in tools["make"]
+              binding = {"validation_head": head, "base": BASE, "platform": platform.platform(), "tools": tools,
+                         "red_only": red_only, "working_makefile_sha256": sha256(current_makefile),
+                         "working_makefile_blob": git("hash-object", "Makefile"), "test_sha256": sha256(test),
+                         "test_blob": git("hash-object", TEST_PATH), "base_makefile_sha256": digest(parent_bytes),
+                         "base_makefile_blob": BASE_MAKEFILE_BLOB,
+                         "author_committer": git("show", "-s", "--format=%an%n%ae%n%cn%n%ce", "HEAD").splitlines()}
+              write_json(OUT / "source-binding.json", binding)
+              if red_only:
+                  assert current_makefile.read_bytes() == parent_bytes
+                  stages = [("parent-red", current_makefile, True)]
+              else:
+                  assert current_makefile.read_bytes() != parent_bytes
+                  stages = [("fixed", current_makefile, False), ("parent-red", baseline, True)]
+              ledgers = {}
+              for label, makefile, red in stages:
+                  ledger, failures = validate_stage(label, makefile, red)
+                  ledgers[label] = ledger
+                  problems.extend(label + ": " + item for item in failures)
+              assert sha256(current_makefile) == binding["working_makefile_sha256"]
+              assert sha256(test) == binding["test_sha256"]
+              assert git("status", "--porcelain", "--untracked-files=no") == ""
+              receipt = {"binding": binding, "stages": {label: {key: ledger[key] for key in
+                         ("methods", "counts", "invocations", "makefile_sha256", "test_sha256")} for label, ledger in ledgers.items()},
+                         "problems": problems, "live_provider_calls": False, "go_or_npm_execution": False,
+                         "secret_loading": False, "make_recipes_executed": True, "assertion_red_required": True}
+              write_json(OUT / "receipt.json", receipt)
+              print(json.dumps(receipt["stages"]))
+              for problem in problems:
+                  print(problem, file=sys.stderr)
+              return bool(problems)
+
+
+          if __name__ == "__main__":
+              try:
+                  sys.exit(main())
+              except Exception:
+                  OUT.mkdir(exist_ok=True)
+                  (OUT / "fatal-error.txt").write_text(traceback.format_exc(), encoding="utf-8")
+                  raise
+          PY
+          python3 "$RUNNER_TEMP/report-filename-validation.py"
+      - name: Compile exact regression source and check whitespace
+        if: always()
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('.github/workflows/scripts/test-make-report-filenames.py')
+          compile(path.read_bytes(), str(path), 'exec')
+          PY
+          git diff --check
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: report-filename-proof-${{ matrix.os }}
+          path: report-filename-proof/
+          if-no-files-found: error
