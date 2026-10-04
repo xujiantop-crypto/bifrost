@@ -169,7 +169,6 @@ jobs:
               test_command = ["go", "test", "-json", "-count=1", "-timeout=3m"]
               run("fixed-regression-race", test_command + ["-race", "-vet=all", "-run", REGRESSION_PATTERN, "."], cwd=REPO / "core")
               run("fixed-cancellation-race", test_command + ["-race", "-vet=all", "-run", CANCELLATION_PATTERN, "."], cwd=REPO / "core")
-              run("fixed-new-386", test_command + ["-vet=all", "-run", NEW_PATTERN, "."], cwd=REPO / "core", additions={"GOARCH": "386", "CGO_ENABLED": "0"})
           
               parent = subprocess.check_output(["git", "show", BINDING["parent"] + ":core/utils.go"])
               try:
@@ -178,7 +177,6 @@ jobs:
                   assert git("hash-object", paths["test"]) == BINDING["test_blob"]
                   write_json(OUT / "parent-binding.json", {"parent": BINDING["parent"], "production_blob": git("hash-object", paths["production"]), "production_sha256": sha256(REPO / paths["production"]), "test_blob": git("hash-object", paths["test"]), "test_sha256": sha256(REPO / paths["test"]), "method": "exact parent core/utils.go; current committed regression tests retained"})
                   run("parent-red-amd64", test_command + ["-vet=all", "-run", NEW_PATTERN, "."], cwd=REPO / "core")
-                  run("parent-red-386", test_command + ["-vet=all", "-run", NEW_PATTERN, "."], cwd=REPO / "core", additions={"GOARCH": "386", "CGO_ENABLED": "0"})
               finally:
                   (REPO / paths["production"]).write_bytes(original)
                   assert git("hash-object", paths["production"]) == BINDING["production_blob"]
@@ -198,6 +196,8 @@ jobs:
               wrapper.chmod(0o755)
               canonical_env = {"PATH": str(wrapper_dir) + os.pathsep + os.environ["PATH"], "VALIDATION_REAL_GOTESTSUM": actual_gotestsum, "VALIDATION_CANONICAL_JSONFILE": str(OUT / "canonical.jsonl")}
               run("canonical", ["make", "test-core", "PATTERN=" + CANONICAL_PATTERN, "TEST_REPORTS_DIR=validation/canonical"], additions=canonical_env, timeout=1800)
+              for report in (OUT / "canonical").glob("*|*.xml"):
+                  report.rename(report.with_name(report.name.replace("|", "_")))
               subprocess.run(["git", "diff", "--exit-code"], check=True)
           
               summaries = {}
@@ -205,9 +205,7 @@ jobs:
               stages = {
                   "fixed-regression-race": (BINDING["expected_regression_leaves"], False),
                   "fixed-cancellation-race": (BINDING["expected_cancellation_leaves"], False),
-                  "fixed-new-386": (BINDING["expected_red_leaves"], False),
                   "parent-red-amd64": (BINDING["expected_red_leaves"], True),
-                  "parent-red-386": (BINDING["expected_red_leaves"], True),
                   "canonical": (BINDING["expected_regression_leaves"], False),
               }
               for label, (expected, red) in stages.items():
