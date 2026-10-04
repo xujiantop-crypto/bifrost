@@ -257,6 +257,19 @@ jobs:
               raise SystemExit(1)
           PY
 
+      - name: Normalize report filenames for portable artifacts
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          root = pathlib.Path('validation')
+          for label in ('hooks', 'connections', 'mixed', 'respawn'):
+              files = list((root / label).glob('*.xml'))
+              assert len(files) <= 1, (label, files)
+              if files:
+                  files[0].rename(root / label / (label + '.xml'))
+          PY
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
