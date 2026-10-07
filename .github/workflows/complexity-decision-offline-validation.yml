@@ -1,0 +1,180 @@
+name: Complexity Decision offline validation
+on:
+  push:
+    branches: [test/complexity-decision-presence-validation]
+permissions:
+  contents: read
+env:
+  TESTED_HEAD: fcaa72e1a65ee7db294c2515bea3731fe2dcdc2c
+  BASELINE_HEAD: 0e9c135bc16e49aabaafc58aaea0a6777a836634
+  GOTELEMETRY: 'off'
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fcaa72e1a65ee7db294c2515bea3731fe2dcdc2c
+          fetch-depth: 0
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: transports/go.mod
+          cache-dependency-path: |
+            core/go.sum
+            framework/go.sum
+            transports/go.sum
+            plugins/*/go.sum
+      - name: Verify sources and prepare exact upstream overlay
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$TESTED_HEAD"
+          test "$(git rev-parse HEAD^2)" = "$BASELINE_HEAD"
+          go work init ./core ./framework ./transports
+          for d in plugins/*; do test ! -f "$d/go.mod" || go work use "./$d"; done
+          mkdir -p test-reports
+          git show "$BASELINE_HEAD:transports/bifrost-http/lib/config.go" > /tmp/decision-baseline-config.go
+          python - <<'PY'
+          import hashlib, json, os, subprocess
+          from pathlib import Path
+          def git(*args):
+              return subprocess.check_output(['git', *args], text=True).strip()
+          changed = git('diff', '--name-only', os.environ['BASELINE_HEAD'], 'HEAD').splitlines()
+          expected = ['transports/bifrost-http/lib/config.go', 'transports/bifrost-http/lib/config_test.go', 'transports/changelog.md']
+          assert sorted(changed) == sorted(expected), changed
+          metadata = {'tested_head': git('rev-parse', 'HEAD'), 'parents': git('show', '-s', '--format=%P', 'HEAD').split(),
+                      'baseline_head': os.environ['BASELINE_HEAD'], 'changed_files': changed,
+                      'source_sha256': {p: hashlib.sha256(Path(p).read_bytes()).hexdigest() for p in expected},
+                      'go_version': subprocess.check_output(['go', 'version'], text=True).strip(),
+                      'go_env': json.loads(subprocess.check_output(['go', 'env', '-json', 'CGO_ENABLED', 'GOOS', 'GOARCH', 'GOWORK'], text=True))}
+          assert metadata['go_env']['CGO_ENABLED'] == '1', metadata
+          Path('test-reports/sources.json').write_text(json.dumps(metadata, indent=2) + '\n')
+          Path('/tmp/decision-overlay.json').write_text(json.dumps({'Replace': {str(Path('transports/bifrost-http/lib/config.go').resolve()): '/tmp/decision-baseline-config.go'}}) + '\n')
+          PY
+      - name: Red, SQLite restart, race and related offline checks
+        run: |
+          set -euo pipefail
+          reports="$GITHUB_WORKSPACE/test-reports"
+          run_record() {
+            label="$1"; cwd="$2"; shift 2
+            printf '%q ' "$@" > "$reports/$label-command.txt"
+            printf '\n' >> "$reports/$label-command.txt"
+            set +e
+            (cd "$cwd" && "$@") > "$reports/$label.jsonl" 2> "$reports/$label.stderr.txt"
+            result=$?
+            set -e
+            printf '%s\n' "$result" > "$reports/$label-exit.txt"
+          }
+          scope='^(TestMergeGovernanceConfig_.*Complexity|TestLoadConfig_ComplexityFilePresence|TestSchemaComplexity)'
+          run_record red transports go test -json -count=1 -timeout 8m -overlay=/tmp/decision-overlay.json -run '^(TestMergeGovernanceConfig_ComplexityFilePresence|TestLoadConfig_ComplexityFilePresence)$' ./bifrost-http/lib
+          run_record scoped transports go test -json -count=3 -timeout 8m -run "$scope" ./bifrost-http/lib
+          run_record race transports go test -json -race -count=1 -timeout 8m -run "$scope" ./bifrost-http/lib
+          run_record framework framework go test -json -count=1 -timeout 8m -run Complexity ./configstore
+          run_record routing plugins/routing go test -json -count=1 -timeout 8m ./complexity
+          run_record full-lib transports go test -json -count=1 -timeout 8m ./bifrost-http/lib
+          run_record vet-lib transports go vet ./bifrost-http/lib
+          run_record vet-framework framework go vet ./configstore
+          run_record vet-routing plugins/routing go vet ./complexity
+          python - <<'PY'
+          import difflib, json, os, subprocess
+          from pathlib import Path
+          rows = []
+          for path in ['transports/bifrost-http/lib/config.go', 'transports/bifrost-http/lib/config_test.go']:
+              before = subprocess.check_output(['git', 'show', os.environ['BASELINE_HEAD'] + ':' + path]).decode().replace('\r\n', '\n')
+              after = Path(path).read_text().replace('\r\n', '\n')
+              diffs = []
+              for label, source in [('upstream', before), ('current', after)]:
+                  formatted = subprocess.check_output(['gofmt'], input=source.encode()).decode()
+                  diff = ''.join(difflib.unified_diff(source.splitlines(keepends=True), formatted.splitlines(keepends=True), fromfile=path, tofile=path + ' (gofmt)'))
+                  Path('test-reports/' + Path(path).name + '-' + label + '-gofmt.diff').write_text(diff)
+                  diffs.append([line for line in diff.splitlines() if not line.startswith('@@')])
+              rows.append({'path': path, 'formatting_residual_equal_upstream': diffs[0] == diffs[1]})
+          Path('test-reports/format-check.json').write_text(json.dumps(rows, indent=2) + '\n')
+          assert all(row['formatting_residual_equal_upstream'] for row in rows), rows
+          PY
+      - name: Attempt canonical HTTP transport target
+        if: always()
+        run: |
+          set +e
+          timeout 12m make test-http-transport > test-reports/canonical-http.log 2>&1
+          printf '%s\n' "$?" > test-reports/canonical-http-exit.txt
+          exit 0
+      - name: Capture untouched upstream full-lib comparison
+        if: always()
+        run: |
+          set -euo pipefail
+          git worktree add --detach /tmp/decision-upstream "$BASELINE_HEAD"
+          cd /tmp/decision-upstream
+          go work init ./core ./framework ./transports
+          for d in plugins/*; do test ! -f "$d/go.mod" || go work use "./$d"; done
+          cd transports
+          set +e
+          go test -json -count=1 -timeout 8m ./bifrost-http/lib > "$GITHUB_WORKSPACE/test-reports/upstream-full-lib.jsonl" 2> "$GITHUB_WORKSPACE/test-reports/upstream-full-lib.stderr.txt"
+          printf '%s\n' "$?" > "$GITHUB_WORKSPACE/test-reports/upstream-full-lib-exit.txt"
+          exit 0
+      - name: Require current regression coverage and record every failure
+        if: always()
+        run: |
+          python - <<'PY'
+          import collections, json, xml.etree.ElementTree as ET
+          from pathlib import Path
+          reports = Path('test-reports')
+          results = {}
+          for path in reports.glob('*-exit.txt'):
+              label = path.name.removesuffix('-exit.txt')
+              events = []
+              eventfile = reports / (label + '.jsonl')
+              if eventfile.exists():
+                  for line in eventfile.read_text().splitlines():
+                      try: events.append(json.loads(line))
+                      except ValueError: pass
+              results[label] = {'exit': int(path.read_text()),
+                  'passes': collections.Counter(e['Test'] for e in events if e.get('Action') == 'pass' and e.get('Test')),
+                  'failures': [e['Test'] for e in events if e.get('Action') == 'fail' and e.get('Test')],
+                  'skips': [e['Test'] for e in events if e.get('Action') == 'skip' and e.get('Test')],
+                  'failure_outputs': {name: ''.join(e.get('Output', '') for e in events if e.get('Test') == name)
+                      for name in {e['Test'] for e in events if e.get('Action') == 'fail' and e.get('Test')}}}
+          canonical = []
+          for xml in reports.glob('http-transport-*.xml'):
+              root = ET.parse(xml).getroot()
+              cases = list(root.iter('testcase'))
+              canonical.append({'path': str(xml), 'cases': len(cases),
+                  'failures': [{'name': case.get('name'), 'classname': case.get('classname'),
+                      'text': ''.join(''.join(child.itertext()) for child in case if child.tag in ('failure', 'error'))}
+                      for case in cases if any(child.tag in ('failure', 'error') for child in case)],
+                  'skips': [case.get('name') for case in cases if case.find('skipped') is not None]})
+          reports.joinpath('canonical-reports.json').write_text(json.dumps(canonical, indent=2) + '\n')
+          reports.joinpath('results.json').write_text(json.dumps(results, indent=2) + '\n')
+          new = [name for name in results['scoped']['passes'] if name.startswith(('TestMergeGovernanceConfig_ComplexityFilePresence/', 'TestLoadConfig_ComplexityFilePresence/'))]
+          assert len(new) == 17, new
+          for label, count in [('scoped', 3), ('race', 1)]:
+              row = results[label]
+              assert row['exit'] == 0 and not row['failures'] and not row['skips'], (label, row)
+              assert all(row['passes'][name] == count for name in new), (label, row)
+          expected_red = {
+              'TestMergeGovernanceConfig_ComplexityFilePresence/' + name for name in [
+                  'omitted_classifier_with_legacy_hash', 'omitted_classifier_after_explicit_decision_file',
+                  'explicit_decision_preserves_omitted_decision_settings', 'semantic_fallback_preserves_omitted_decision_settings',
+                  'classifier_case_and_space_normalize']}
+          expected_red.update('TestLoadConfig_ComplexityFilePresence/' + name for name in [
+              'omitted_classifier_with_legacy_hash', 'omitted_classifier_after_explicit_decision_file',
+              'explicit_decision_preserves_omitted_decision_settings'])
+          leaves = {name for name in results['red']['failures'] if '/' in name}
+          assert results['red']['exit'] == 1 and leaves == expected_red and not results['red']['skips'], results['red']
+          assert len([name for name in results['red']['passes'] if '/' in name]) == 9, results['red']
+          import re
+          for name in expected_red:
+              output = results['red']['failure_outputs'][name]
+              want, got = ('"decision"', '"semantic"') if '/omitted_classifier_' in name else ('5', '1')
+              assert re.search(r'expected:\s*' + re.escape(want), output), (name, output)
+              assert re.search(r'actual\s*:\s*' + re.escape(got), output), (name, output)
+          for label in ['framework', 'routing', 'vet-lib', 'vet-framework', 'vet-routing']:
+              assert results[label]['exit'] == 0 and not results[label]['failures'], (label, results[label])
+          assert all(row['formatting_residual_equal_upstream'] for row in json.loads(reports.joinpath('format-check.json').read_text()))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: complexity-decision-offline-evidence
+          path: test-reports
+          if-no-files-found: error
