@@ -1,0 +1,78 @@
+name: Gemini client signature offline validation
+on:
+  push:
+    branches: [test/gemini-client-thought-signature-validation-v2]
+permissions:
+  contents: read
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: bash
+    env:
+      SOURCE_SHA: 'da1ebf4683515be9ef8dd79d8c811871f926d7ae'
+      SOURCE_TREE: '9ef1d2e911536a6aa9072eeb24262f2a72a8c0b0'
+      SOURCE_PARENT_SHA: '3918df7553c290505780b53441e8cd27f2e50339'
+      GOWORK: 'off'
+      GEMINI_API_KEY: ''
+      VERTEX_API_KEY: ''
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: xujiantop-crypto/bifrost
+          ref: 'da1ebf4683515be9ef8dd79d8c811871f926d7ae'
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Verify frozen source
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(git rev-parse HEAD^{tree})" = "$SOURCE_TREE"
+          test "$(git rev-parse HEAD^)" = "$SOURCE_PARENT_SHA"
+          test -z "$(git status --porcelain)"
+          mkdir -p "$RUNNER_TEMP/signature-validation"
+          git show -s --format='source=%H%ntree=%T%nparents=%P%nauthor=%an <%ae>%ncommitter=%cn <%ce>' HEAD > "$RUNNER_TEMP/signature-validation/source-binding.txt"
+          printf 'workflow=%s\n' "$GITHUB_SHA" >> "$RUNNER_TEMP/signature-validation/source-binding.txt"
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: core/go.mod
+          cache-dependency-path: core/go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Canonical scoped Gemini tests
+        run: |
+          set -euo pipefail
+          go version | tee "$RUNNER_TEMP/signature-validation/go-version.txt"
+          make test-core PROVIDER=gemini PATTERN=ClientThoughtSignature | tee "$RUNNER_TEMP/signature-validation/canonical-make.txt"
+      - name: Native conversion and retry race regressions
+        run: |
+          set -euo pipefail
+          cd core
+          go test -race -count=1 -run ClientThoughtSignature -v ./providers/gemini . | tee "$RUNNER_TEMP/signature-validation/race.txt"
+      - name: Vet impacted packages and verify formatting
+        run: |
+          set -euo pipefail
+          cd core
+          go vet . ./providers/gemini ./providers/vertex 2>&1 | tee "$RUNNER_TEMP/signature-validation/vet.txt"
+          test -z "$(gofmt -l providers/gemini/utils.go providers/gemini/chat_test.go encryptedreasoning.go encryptedreasoning_test.go)"
+      - name: Provider harness structure
+        run: |
+          set -euo pipefail
+          node tests/e2e/api/runners/augment-provider-harness.mjs --source tests/e2e/api/collections/provider-harness.json --out "$RUNNER_TEMP/signature-validation/harness-augmented.json"
+          node tests/e2e/api/runners/filter-collection.mjs --source "$RUNNER_TEMP/signature-validation/harness-augmented.json" --out "$RUNNER_TEMP/signature-validation/harness-filtered.json" --feature 'client-thought-signature-fixture'
+          node -e 'const fs=require("node:fs");const data=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));const names=[];function walk(items){for(const item of items||[]){if(item.request)names.push(item.name);walk(item.item);}}walk(data.item);if(names.length!==6)throw new Error("Expected six signature fixture requests, got "+names.length);fs.writeFileSync(process.argv[2],JSON.stringify({requests:names.length,names},null,2));' "$RUNNER_TEMP/signature-validation/harness-filtered.json" "$RUNNER_TEMP/signature-validation/harness-count.json"
+          node --test tests/e2e/api/runners/gemini-client-signature-fixture.test.mjs | tee "$RUNNER_TEMP/signature-validation/fixture-script-tests.txt"
+      - name: Save scoped JUnit
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/signature-validation/junit"
+          if [ -d test-reports ]; then cp -R test-reports/. "$RUNNER_TEMP/signature-validation/junit/"; fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gemini-client-signature-offline
+          path: ${{ runner.temp }}/signature-validation
+          if-no-files-found: error
